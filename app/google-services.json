@@ -7,6 +7,25 @@
   "client": [
     {
       "client_info": {
+        "mobilesdk_app_id": "1:142470848601:android:e4d8c63b4fa25a30ae5148",
+        "android_client_info": {
+          "package_name": "com.example.signalspot"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC_MeiNdytGBuJcx8s0xEeAQUXnirzs0og"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
         "mobilesdk_app_id": "1:142470848601:android:9fb9fb131d277b25ae5148",
         "android_client_info": {
           "package_name": "com.signalspot.app"
