@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "142470848601",
+    "project_id": "signalspot-c09f2",
+    "storage_bucket": "signalspot-c09f2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:142470848601:android:9fb9fb131d277b25ae5148",
+        "android_client_info": {
+          "package_name": "com.signalspot.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC_MeiNdytGBuJcx8s0xEeAQUXnirzs0og"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
