@@ -318,18 +318,28 @@ fun SignalHeatmapView(
 
             SmallFloatingActionButton(
                 onClick = {
-                    if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
-                        mapView.controller.animateTo(GeoPoint(userLat, userLng))
-                    } else {
-                        mapView.controller.animateTo(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
-                    }
+                    mapView.controller.animateTo(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
                 }
             ) {
                 Text(
-                    text = if (userLat != null) "My GPS" else "Campus",
+                    text = "BSU Campus",
                     modifier = Modifier.padding(horizontal = 8.dp),
                     style = MaterialTheme.typography.labelSmall
                 )
+            }
+
+            if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        mapView.controller.animateTo(GeoPoint(userLat, userLng))
+                    }
+                ) {
+                    Text(
+                        text = "My GPS",
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
             }
         }
 

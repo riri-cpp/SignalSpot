@@ -6,10 +6,14 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
 import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.os.Bundle
 import android.os.Looper
+import android.os.SystemClock
 import android.telephony.CellSignalStrength
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
@@ -23,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -58,6 +63,19 @@ import java.util.UUID
 private const val MIN_WALK_DISTANCE_METERS = 20f
 private const val MIN_TIME_BETWEEN_SAVES_MS = 10_000L
 private const val MAX_ALLOWED_GPS_ACCURACY_METERS = 30f
+
+// Anti-teleport thresholds:
+// Rejects location fixes older than 10 seconds
+private const val MAX_LOCATION_AGE_NANOS = 10_000_000_000L
+// Maximum plausible walking/campus movement jump before requiring multi-fix confirmation
+private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 60f
+private const val MAX_PLAUSIBLE_SPEED_MPS = 12.0 // ~43 km/h
+private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 3
+
+// Approximate BSU Alangilan center & campus geofence radius (optional campus guard)
+private const val BSU_CAMPUS_LAT = 13.7847
+private const val BSU_CAMPUS_LON = 121.0735
+private const val BSU_CAMPUS_RADIUS_METERS = 650f
 
 /**
  * Holds the raw snapshot of cellular and Wi-Fi signal metrics for UI display
@@ -96,7 +114,7 @@ data class RawSignalSnapshot(
 }
 
 /**
- * Live signal reader + GPS movement-gated auto-logger (Proposal R1, Risk #3, Risk #4, Risk #5).
+ * Live signal reader + GPS movement-gated auto-logger with Anti-Teleport & Hardware GNSS filtering.
  */
 @SuppressLint("MissingPermission")
 @Composable
@@ -125,11 +143,18 @@ fun SignalCollectorScreen(
     }
 
     var isAutoLogging by remember { mutableStateOf(true) }
+    // When enabled on campus, prefers pure satellite GPS and blocks out-of-campus cell/hotspot teleports
+    var preferPureSatelliteGps by remember { mutableStateOf(true) }
+    var lockToBsuCampusArea by remember { mutableStateOf(false) }
+
     var currentLocation by remember { mutableStateOf<Location?>(null) }
     var lastSavedLocation by remember { mutableStateOf<Location?>(null) }
     var lastSavedTimeMs by remember { mutableLongStateOf(0L) }
+    var lastHardwareGpsFixTimeMs by remember { mutableLongStateOf(0L) }
+    var candidateJumpLocation by remember { mutableStateOf<Location?>(null) }
+    var candidateJumpCount by remember { mutableIntStateOf(0) }
     var sessionSavedCount by remember { mutableIntStateOf(0) }
-    var gpsStatusText by remember { mutableStateOf("Searching for GPS...") }
+    var gpsStatusText by remember { mutableStateOf("Searching for GPS satellites...") }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -153,38 +178,130 @@ fun SignalCollectorScreen(
 
     // Foreground-only GPS listener: starts on RESUME and stops immediately on PAUSE / close (Risk #5)
     val lifecycleOwner = remember(context) { context.findLifecycleOwner() }
-    DisposableEffect(hasPermissions, isAutoLogging, lifecycleOwner) {
+    DisposableEffect(
+        hasPermissions,
+        isAutoLogging,
+        preferPureSatelliteGps,
+        lockToBsuCampusArea,
+        lifecycleOwner
+    ) {
         if (!hasPermissions) {
             onDispose { }
         } else {
             val fusedClient = LocationServices.getFusedLocationProviderClient(context)
-            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 3000L)
+            val locationManager =
+                context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2500L)
                 .setMinUpdateIntervalMillis(1500L)
+                .setMaxUpdateAgeMillis(5000L)
+                .setWaitForAccurateLocation(true)
                 .build()
 
-            fun handleNewLocation(loc: Location) {
-                currentLocation = loc
-                onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
+            fun handleNewLocation(loc: Location, isFromHardwareGps: Boolean) {
                 val snapshot = readCurrentSignal(context)
                 displayOutput = snapshot.formattedSummary
 
+                // 1. Reject stale cached locations (older than 10 seconds)
+                val ageNanos = SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos
+                if (ageNanos > MAX_LOCATION_AGE_NANOS) {
+                    return
+                }
+
+                // 2. Reject Mock locations
+                @Suppress("DEPRECATION")
+                if (loc.isFromMockProvider) {
+                    gpsStatusText = "Rejected mock location fix"
+                    return
+                }
+
+                // 3. If hardware satellite GPS is actively providing fixes (within last 8s),
+                // ignore Fused network/Wi-Fi hotspot locations that cause campus teleportation!
+                val nowMs = System.currentTimeMillis()
+                if (isFromHardwareGps) {
+                    lastHardwareGpsFixTimeMs = nowMs
+                } else if (preferPureSatelliteGps && (nowMs - lastHardwareGpsFixTimeMs) < 8_000L) {
+                    return
+                }
+
+                // 4. Optional BSU Campus Geofence Guard:
+                // Blocks cell-tower or student-hotspot database teleports outside BSU Alangilan
+                if (lockToBsuCampusArea) {
+                    val distFromBsu = FloatArray(1)
+                    Location.distanceBetween(
+                        BSU_CAMPUS_LAT,
+                        BSU_CAMPUS_LON,
+                        loc.latitude,
+                        loc.longitude,
+                        distFromBsu
+                    )
+                    if (distFromBsu[0] > BSU_CAMPUS_RADIUS_METERS) {
+                        gpsStatusText =
+                            "Blocked teleport (${distFromBsu[0].toInt()}m from BSU)"
+                        return
+                    }
+                }
+
+                // 5. CRITICAL FIX: Check 30m accuracy BEFORE updating currentLocation or moving map!
+                // Previously, cell-tower fixes (accuracy 300m-1500m) updated currentLocation first,
+                // which teleported the blue dot to the cell tower outside campus.
+                if (loc.accuracy <= 0f || loc.accuracy > MAX_ALLOWED_GPS_ACCURACY_METERS) {
+                    val keepLabel = if (currentLocation != null) " · Holding last good spot" else ""
+                    gpsStatusText =
+                        "Standby: Weak GPS (±${loc.accuracy.toInt()}m > 30m)$keepLabel"
+                    return
+                }
+
+                // 6. Anti-Teleport / Impossible Velocity Spike Filter:
+                // If a single fix suddenly jumps > 60m at > 12 m/s (e.g. nearby mobile hotspot MAC
+                // registered in another town), reject it unless 3 consecutive accurate fixes confirm it.
+                val prevVerified = currentLocation
+                if (prevVerified != null) {
+                    val jumpDist = prevVerified.distanceTo(loc)
+                    val dtSec = ((loc.elapsedRealtimeNanos - prevVerified.elapsedRealtimeNanos) /
+                        1_000_000_000.0).coerceAtLeast(0.5)
+                    val speedMps = jumpDist / dtSec
+
+                    if (jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
+                        speedMps > MAX_PLAUSIBLE_SPEED_MPS
+                    ) {
+                        val candidate = candidateJumpLocation
+                        if (candidate != null && candidate.distanceTo(loc) <= 30f) {
+                            candidateJumpCount++
+                        } else {
+                            candidateJumpLocation = loc
+                            candidateJumpCount = 1
+                        }
+
+                        if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
+                            gpsStatusText =
+                                "Filtered GPS spike (${jumpDist.toInt()}m jump blocked)"
+                            return
+                        }
+                        // Confirmed new location after 3 consistent fixes
+                        candidateJumpLocation = null
+                        candidateJumpCount = 0
+                    } else {
+                        candidateJumpLocation = null
+                        candidateJumpCount = 0
+                    }
+                }
+
+                // Verified, accurate, non-teleported location!
+                currentLocation = loc
+                onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
+                val sourceTag = if (isFromHardwareGps) "GNSS" else "Fused"
+
                 if (!isAutoLogging) {
-                    gpsStatusText = "Standby: Paused (±${loc.accuracy.toInt()}m)"
+                    gpsStatusText = "Standby: Paused ($sourceTag ±${loc.accuracy.toInt()}m)"
                     return
                 }
 
-                // Proposal R1 & Risk #3: Skip auto-saving if GPS accuracy is worse than 30 meters
-                if (loc.accuracy > MAX_ALLOWED_GPS_ACCURACY_METERS) {
-                    gpsStatusText = "Standby: Weak GPS (±${loc.accuracy.toInt()}m > 30m)"
-                    return
-                }
+                val prevSaved = lastSavedLocation
+                val movedMeters = prevSaved?.distanceTo(loc) ?: Float.MAX_VALUE
+                val elapsedMs = nowMs - lastSavedTimeMs
 
-                val now = System.currentTimeMillis()
-                val prevLoc = lastSavedLocation
-                val movedMeters = prevLoc?.distanceTo(loc) ?: Float.MAX_VALUE
-                val elapsedMs = now - lastSavedTimeMs
-
-                val shouldAutoSave = prevLoc == null ||
+                val shouldAutoSave = prevSaved == null ||
                     (movedMeters >= MIN_WALK_DISTANCE_METERS && elapsedMs >= MIN_TIME_BETWEEN_SAVES_MS)
 
                 if (shouldAutoSave) {
@@ -195,33 +312,50 @@ fun SignalCollectorScreen(
                     )
                     onReadingCaptured?.invoke(reading)
                     lastSavedLocation = loc
-                    lastSavedTimeMs = now
+                    lastSavedTimeMs = nowMs
                     sessionSavedCount++
                     gpsStatusText =
-                        "Auto-Recording: Saved #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
+                        "Auto-Recording ($sourceTag): Saved #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
                 } else {
                     gpsStatusText =
-                        "Auto-Recording: ${movedMeters.toInt()}m / 20m walked (±${loc.accuracy.toInt()}m)"
+                        "Auto-Recording ($sourceTag): ${movedMeters.toInt()}m / 20m walked (±${loc.accuracy.toInt()}m)"
                 }
             }
 
-            val callback = object : LocationCallback() {
+            val fusedCallback = object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
                     val loc = result.lastLocation ?: return
-                    handleNewLocation(loc)
+                    handleNewLocation(loc, isFromHardwareGps = false)
                 }
+            }
+
+            val hardwareGpsListener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    handleNewLocation(location, isFromHardwareGps = true)
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                override fun onProviderEnabled(provider: String) {}
+                override fun onProviderDisabled(provider: String) {}
             }
 
             fun startLocationUpdates() {
                 try {
-                    fusedClient.lastLocation.addOnSuccessListener { loc ->
-                        if (loc != null && currentLocation == null) {
-                            handleNewLocation(loc)
-                        }
+                    // Request direct hardware satellite GPS (immune to cell-tower & student hotspot teleports)
+                    if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                        locationManager.requestLocationUpdates(
+                            LocationManager.GPS_PROVIDER,
+                            2000L,
+                            0f,
+                            hardwareGpsListener,
+                            Looper.getMainLooper()
+                        )
                     }
+                    // Also run Fused High-Accuracy as backup when satellites are still locking
                     fusedClient.requestLocationUpdates(
                         locationRequest,
-                        callback,
+                        fusedCallback,
                         Looper.getMainLooper()
                     )
                 } catch (_: SecurityException) {
@@ -229,7 +363,11 @@ fun SignalCollectorScreen(
             }
 
             fun stopLocationUpdates() {
-                fusedClient.removeLocationUpdates(callback)
+                fusedClient.removeLocationUpdates(fusedCallback)
+                try {
+                    locationManager.removeUpdates(hardwareGpsListener)
+                } catch (_: SecurityException) {
+                }
             }
 
             val observer = LifecycleEventObserver { _, event ->
@@ -260,17 +398,17 @@ fun SignalCollectorScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
+                .padding(horizontal = 12.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
                 text = displayOutput,
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.titleSmall,
                 textAlign = TextAlign.Center
             )
 
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(2.dp))
 
             val queueTag = if (pendingOfflineCount > 0) " · Offline Queued: $pendingOfflineCount" else ""
             Text(
@@ -280,7 +418,28 @@ fun SignalCollectorScreen(
                 textAlign = TextAlign.Center
             )
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Anti-Teleport Protection Chips
+            if (hasPermissions) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    FilterChip(
+                        selected = preferPureSatelliteGps,
+                        onClick = { preferPureSatelliteGps = !preferPureSatelliteGps },
+                        label = { Text("Pure GNSS Priority", style = MaterialTheme.typography.labelSmall) }
+                    )
+                    FilterChip(
+                        selected = lockToBsuCampusArea,
+                        onClick = { lockToBsuCampusArea = !lockToBsuCampusArea },
+                        label = { Text("BSU Campus Lock", style = MaterialTheme.typography.labelSmall) }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+            }
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -319,7 +478,7 @@ fun SignalCollectorScreen(
                             val loc = currentLocation
                             val snapshot = readCurrentSignal(context)
                             displayOutput = snapshot.formattedSummary
-                            if (loc != null) {
+                            if (loc != null && loc.accuracy <= MAX_ALLOWED_GPS_ACCURACY_METERS) {
                                 val reading = snapshot.toSignalReading(
                                     lat = loc.latitude,
                                     lng = loc.longitude,
@@ -332,7 +491,8 @@ fun SignalCollectorScreen(
                                 gpsStatusText =
                                     "Recorded Spot #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
                             } else {
-                                gpsStatusText = "Waiting for GPS lock to record spot..."
+                                gpsStatusText =
+                                    "Wait for accurate GPS (≤30m) before recording..."
                             }
                         }
                     ) {
