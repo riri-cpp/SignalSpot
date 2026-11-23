@@ -8,6 +8,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -62,7 +64,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                Box(modifier = Modifier.fillMaxSize()) {
+                // Root Surface ensures LocalContentColor is properly light in Dark Mode and dark in Light Mode
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                    contentColor = MaterialTheme.colorScheme.onBackground
+                ) {
+                    Box(modifier = Modifier.fillMaxSize()) {
                     // Full-screen interactive OpenStreetMap heatmap with floating filters & controls
                     SignalHeatmapView(
                         modifier = Modifier.fillMaxSize(),
@@ -72,54 +80,59 @@ class MainActivity : ComponentActivity() {
                         userLat = userLat,
                         userLng = userLng,
                         userAccuracyMeters = userAccuracy,
-                        bottomControlsPadding = bottomCardHeightDp + 6.dp,
+                        bottomControlsPadding = bottomCardHeightDp + 8.dp,
                         onRequestMyLocation = { locateRequestCounter++ }
                     )
 
-                    // Sleek floating bottom Live Signal & Auto-Recorder card
-                    SignalCollectorBottomCard(
+                    // Measure outer wrapper BEFORE navigationBarsPadding() so bottomCardHeightDp
+                    // includes both the system nav bar AND the card (nothing gets hidden behind it!)
+                    Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .navigationBarsPadding()
                             .onGloballyPositioned { coords ->
                                 bottomCardHeightPx = coords.size.height
+                            }
+                            .navigationBarsPadding()
+                    ) {
+                        SignalCollectorBottomCard(
+                            pendingOfflineCount = pendingOfflineCount,
+                            locateRequestCounter = locateRequestCounter,
+                            onReadingCaptured = { reading ->
+                                repository.saveReading(reading)
                             },
-                        pendingOfflineCount = pendingOfflineCount,
-                        locateRequestCounter = locateRequestCounter,
-                        onReadingCaptured = { reading ->
-                            repository.saveReading(reading)
-                        },
-                        onLocationUpdated = { lat, lng, accuracy ->
-                            userLat = lat
-                            userLng = lng
-                            userAccuracy = accuracy
-                        },
-                        onSendTestReading = {
-                            val carriers = listOf("Smart", "Globe", "DITO")
-                            val carrier = carriers[testCounter % carriers.size]
-                            val level = Random.nextInt(1, 5)
-                            val dbm = -110 + (level * 12)
-                            val lat = 13.7847 + Random.nextDouble(-0.0004, 0.0004)
-                            val lng = 121.0735 + Random.nextDouble(-0.0004, 0.0004)
+                            onLocationUpdated = { lat, lng, accuracy ->
+                                userLat = lat
+                                userLng = lng
+                                userAccuracy = accuracy
+                            },
+                            onSendTestReading = {
+                                val carriers = listOf("Smart", "Globe", "DITO")
+                                val carrier = carriers[testCounter % carriers.size]
+                                val level = Random.nextInt(1, 5)
+                                val dbm = -110 + (level * 12)
+                                val lat = 13.7847 + Random.nextDouble(-0.0004, 0.0004)
+                                val lng = 121.0735 + Random.nextDouble(-0.0004, 0.0004)
 
-                            repository.saveReading(
-                                SignalReading(
-                                    id = UUID.randomUUID().toString(),
-                                    lat = lat,
-                                    lng = lng,
-                                    gridKey = gridKeyFor(lat, lng),
-                                    accuracy = 8.0f,
-                                    carrier = carrier,
-                                    networkType = "4G",
-                                    dbm = dbm,
-                                    level = level,
-                                    wifiDbm = -62,
-                                    timestamp = System.currentTimeMillis()
+                                repository.saveReading(
+                                    SignalReading(
+                                        id = UUID.randomUUID().toString(),
+                                        lat = lat,
+                                        lng = lng,
+                                        gridKey = gridKeyFor(lat, lng),
+                                        accuracy = 8.0f,
+                                        carrier = carrier,
+                                        networkType = "4G",
+                                        dbm = dbm,
+                                        level = level,
+                                        wifiDbm = -62,
+                                        timestamp = System.currentTimeMillis()
+                                    )
                                 )
-                            )
-                            testCounter++
-                        }
-                    )
+                                testCounter++
+                            }
+                        )
+                    }
+                }
                 }
             }
         }
