@@ -1,7 +1,5 @@
 package com.example.signalspot.map
 
-import android.content.Context
-import android.content.ContextWrapper
 import android.graphics.Color as AndroidColor
 import android.location.Location
 import android.text.format.DateUtils
@@ -41,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -48,14 +47,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.signalspot.collector.SignalStrengthBars
 import com.example.signalspot.data.GRID_SIZE
 import com.example.signalspot.data.SignalReading
@@ -66,6 +67,7 @@ import com.example.signalspot.ui.theme.SignalWeakRed
 import java.util.Locale
 import kotlin.math.floor
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -185,28 +187,44 @@ private fun buildRealSquarePolygon(
     }
 }
 
-private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
-    val delta = 0.000045
+private fun buildUserAccuracyHalo(lat: Double, lng: Double, accuracyMeters: Float): Polygon {
+    val radiusMeters = accuracyMeters.toDouble().coerceIn(8.0, 150.0)
     return Polygon().apply {
-        points = listOf(
-            GeoPoint(lat - delta, lng - delta),
-            GeoPoint(lat - delta, lng + delta),
-            GeoPoint(lat + delta, lng + delta),
-            GeoPoint(lat + delta, lng - delta)
-        )
-        fillPaint.color = AndroidColor.argb(240, 21, 94, 239)
+        points = Polygon.pointsAsCircle(GeoPoint(lat, lng), radiusMeters)
+        fillPaint.color = AndroidColor.argb(45, 21, 94, 239)
+        outlinePaint.color = AndroidColor.argb(110, 21, 94, 239)
+        outlinePaint.strokeWidth = 2f
+    }
+}
+
+private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
+    return Polygon().apply {
+        points = Polygon.pointsAsCircle(GeoPoint(lat, lng), 4.5)
+        fillPaint.color = AndroidColor.argb(245, 21, 94, 239)
         outlinePaint.color = AndroidColor.WHITE
         outlinePaint.strokeWidth = 5f
     }
 }
 
-private fun Context.findLifecycleOwner(): LifecycleOwner? {
-    var ctx: Context? = this
-    while (ctx is ContextWrapper) {
-        if (ctx is LifecycleOwner) return ctx
-        ctx = ctx.baseContext
+private fun moveCameraSmoothly(mapView: MapView, target: GeoPoint, targetZoom: Double = 18.8) {
+    mapView.controller.stopAnimation(false)
+    val currentCenter = mapView.mapCenter
+    val dist = FloatArray(1)
+    Location.distanceBetween(
+        currentCenter.latitude,
+        currentCenter.longitude,
+        target.latitude,
+        target.longitude,
+        dist
+    )
+    // If jumping far away (e.g., > 2 km from home to BSU Campus), snap directly to avoid stalls
+    if (dist[0] > 2000f) {
+        mapView.controller.setZoom(targetZoom)
+        mapView.controller.setCenter(target)
+    } else {
+        mapView.controller.animateTo(target, targetZoom, 450L)
     }
-    return null
+    mapView.invalidate()
 }
 
 @Composable
@@ -217,9 +235,12 @@ fun SignalHeatmapView(
     syncErrorMessage: String? = null,
     userLat: Double? = null,
     userLng: Double? = null,
-    bottomControlsPadding: Dp = 12.dp
+    userAccuracyMeters: Float? = null,
+    bottomControlsPadding: Dp = 12.dp,
+    onRequestMyLocation: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val carriers = listOf("All", "Smart", "Globe", "DITO")
     val networks = listOf("All", "5G", "4G", "3G", "2G")
 
@@ -227,6 +248,17 @@ fun SignalHeatmapView(
     var selectedNetwork by remember { mutableStateOf("All") }
     var selectedSquareKey by remember { mutableStateOf<String?>(null) }
     var hasAutoCenteredOnUser by remember { mutableStateOf(false) }
+    var mapNoticeMessage by remember { mutableStateOf<String?>(null) }
+    var popupCardHeightPx by remember { mutableIntStateOf(0) }
+    val popupCardHeightDp = with(LocalDensity.current) { popupCardHeightPx.toDp() }
+
+    // Auto-dismiss transient map notices after 3 seconds
+    LaunchedEffect(mapNoticeMessage) {
+        if (mapNoticeMessage != null) {
+            delay(3000L)
+            mapNoticeMessage = null
+        }
+    }
 
     // Required, or map tiles won't load. remember{} makes it run once.
     remember {
@@ -244,7 +276,7 @@ fun SignalHeatmapView(
             )
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
-            controller.setZoom(19.0)
+            controller.setZoom(18.5)
             controller.setCenter(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
         }
     }
@@ -262,13 +294,13 @@ fun SignalHeatmapView(
         if (!hasAutoCenteredOnUser && userLat != null && userLng != null &&
             (userLat != 0.0 || userLng != 0.0)
         ) {
-            mapView.controller.animateTo(GeoPoint(userLat, userLng))
+            moveCameraSmoothly(mapView, GeoPoint(userLat, userLng), 18.8)
             hasAutoCenteredOnUser = true
         }
     }
 
-    // Redraw map squares whenever Firestore readings, filters, selection, or user location changes
-    LaunchedEffect(gridSquares, selectedSquareKey, userLat, userLng) {
+    // Redraw map squares + user GPS halo & dot whenever readings, filters, selection, or GPS changes
+    LaunchedEffect(gridSquares, selectedSquareKey, userLat, userLng, userAccuracyMeters) {
         mapView.overlays.clear()
         gridSquares.forEach { summary ->
             mapView.overlays.add(
@@ -281,12 +313,14 @@ fun SignalHeatmapView(
             )
         }
         if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
+            if (userAccuracyMeters != null && userAccuracyMeters > 0f) {
+                mapView.overlays.add(buildUserAccuracyHalo(userLat, userLng, userAccuracyMeters))
+            }
             mapView.overlays.add(buildUserLocationDot(userLat, userLng))
         }
         mapView.invalidate()
     }
 
-    val lifecycleOwner = context.findLifecycleOwner()
     DisposableEffect(lifecycleOwner, mapView) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -295,11 +329,22 @@ fun SignalHeatmapView(
                 else -> {}
             }
         }
-        lifecycleOwner?.lifecycle?.addObserver(observer)
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            mapView.onResume()
+        }
         onDispose {
-            lifecycleOwner?.lifecycle?.removeObserver(observer)
+            lifecycleOwner.lifecycle.removeObserver(observer)
             mapView.onDetach()
         }
+    }
+
+    val hasLiveGps = userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)
+    // Shift floating action buttons cleanly above the comparison card whenever a square is selected
+    val buttonsBottomPadding = if (selectedSquare != null) {
+        bottomControlsPadding + popupCardHeightDp + 8.dp
+    } else {
+        bottomControlsPadding
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -318,7 +363,6 @@ fun SignalHeatmapView(
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            // Brand + Live Cloud Status Bar
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
@@ -354,7 +398,6 @@ fun SignalHeatmapView(
                         )
                     }
 
-                    // Cloud Sync Pill
                     val (pillText, pillColor) = when {
                         syncErrorMessage != null -> "Check Rules" to SignalWeakRed
                         pendingOfflineCount > 0 -> "$pendingOfflineCount Queued" to SignalFairAmber
@@ -449,9 +492,25 @@ fun SignalHeatmapView(
                     )
                 }
             }
+
+            // Transient Map Feedback Banner (e.g. "No Strong spots found" or "Locating GPS...")
+            AnimatedVisibility(visible = mapNoticeMessage != null) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.inverseSurface,
+                    contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                    shadowElevation = 4.dp
+                ) {
+                    Text(
+                        text = mapNoticeMessage.orEmpty(),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
         }
 
-        // 3. Bottom-Left Compact Legend Pill (hidden while a square popup is open)
+        // 3. Bottom-Left Compact Legend Pill (hidden while square popup covers bottom area)
         if (selectedSquare == null) {
             Surface(
                 modifier = Modifier
@@ -473,63 +532,70 @@ fun SignalHeatmapView(
             }
         }
 
-        // 4. Bottom-Right Floating Map Action Pills
-        if (selectedSquare == null) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 12.dp, bottom = bottomControlsPadding),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                horizontalAlignment = Alignment.End
-            ) {
-                MapPillButton(
-                    text = "Nearest Strong",
-                    containerColor = SignalStrongGreen,
-                    contentColor = Color.White,
-                    onClick = {
-                        val refLat = userLat ?: mapView.mapCenter.latitude
-                        val refLng = userLng ?: mapView.mapCenter.longitude
-                        val strongSquares = gridSquares.filter { it.level == SignalLevel.STRONG }
-                        val nearest = strongSquares.minByOrNull { sq ->
-                            val results = FloatArray(1)
-                            Location.distanceBetween(
-                                refLat,
-                                refLng,
-                                sq.centerLat,
-                                sq.centerLng,
-                                results
-                            )
-                            results[0]
-                        }
-                        if (nearest != null) {
-                            mapView.controller.animateTo(
-                                GeoPoint(nearest.centerLat, nearest.centerLng)
-                            )
-                            selectedSquareKey = nearest.gridKey
-                        }
+        // 4. Bottom-Right Floating Map Action Pills — ALWAYS visible so user can freely toggle!
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 12.dp, bottom = buttonsBottomPadding),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.End
+        ) {
+            MapPillButton(
+                text = "Nearest Strong",
+                containerColor = SignalStrongGreen,
+                contentColor = Color.White,
+                onClick = {
+                    val refLat = if (hasLiveGps) userLat else mapView.mapCenter.latitude
+                    val refLng = if (hasLiveGps) userLng else mapView.mapCenter.longitude
+                    val strongSquares = gridSquares.filter { it.level == SignalLevel.STRONG }
+                    val nearest = strongSquares.minByOrNull { sq ->
+                        val results = FloatArray(1)
+                        Location.distanceBetween(
+                            refLat,
+                            refLng,
+                            sq.centerLat,
+                            sq.centerLng,
+                            results
+                        )
+                        results[0]
                     }
-                )
-
-                MapPillButton(
-                    text = "BSU Campus",
-                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-                    contentColor = MaterialTheme.colorScheme.onSurface,
-                    onClick = {
-                        mapView.controller.animateTo(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
+                    if (nearest != null) {
+                        moveCameraSmoothly(
+                            mapView,
+                            GeoPoint(nearest.centerLat, nearest.centerLng),
+                            19.0
+                        )
+                        selectedSquareKey = nearest.gridKey
+                    } else {
+                        mapNoticeMessage = "No Strong (green) squares found for this filter"
                     }
-                )
-
-                if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
-                    MapPillButton(
-                        text = "My GPS",
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                        onClick = {
-                            mapView.controller.animateTo(GeoPoint(userLat, userLng))
-                        }
-                    )
                 }
-            }
+            )
+
+            MapPillButton(
+                text = "BSU Campus",
+                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                onClick = {
+                    selectedSquareKey = null
+                    moveCameraSmoothly(mapView, GeoPoint(CAMPUS_LAT, CAMPUS_LON), 18.5)
+                }
+            )
+
+            MapPillButton(
+                text = if (hasLiveGps) "My GPS" else "Find GPS",
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                onClick = {
+                    selectedSquareKey = null
+                    onRequestMyLocation?.invoke()
+                    if (hasLiveGps) {
+                        moveCameraSmoothly(mapView, GeoPoint(userLat, userLng), 19.0)
+                    } else {
+                        mapNoticeMessage = "Locating your GPS position..."
+                    }
+                }
+            )
         }
 
         // 5. Upgraded Square-Tap Carrier Comparison Sheet/Card
@@ -541,6 +607,9 @@ fun SignalHeatmapView(
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
                 .padding(start = 12.dp, end = 12.dp, bottom = bottomControlsPadding)
+                .onGloballyPositioned { coords ->
+                    popupCardHeightPx = coords.size.height
+                }
         ) {
             val tapped = selectedSquare
             if (tapped != null) {
@@ -668,7 +737,6 @@ private fun SquareComparisonCard(
             HorizontalDivider()
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Side-by-side structured rows for Smart, Globe, DITO
             listOf("Smart", "Globe", "DITO").forEach { cName ->
                 val cList = summary.allReadingsInSquare.filter {
                     it.carrier.equals(cName, ignoreCase = true)
@@ -744,7 +812,6 @@ private fun SquareComparisonCard(
                 }
             }
 
-            // Wi-Fi row
             val wifiReadings = summary.allReadingsInSquare.mapNotNull { it.wifiDbm }
             Row(
                 modifier = Modifier

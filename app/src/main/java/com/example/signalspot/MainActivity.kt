@@ -42,6 +42,8 @@ class MainActivity : ComponentActivity() {
                 var syncErrorMessage by remember { mutableStateOf<String?>(null) }
                 var userLat by remember { mutableStateOf<Double?>(null) }
                 var userLng by remember { mutableStateOf<Double?>(null) }
+                var userAccuracy by remember { mutableStateOf<Float?>(null) }
+                var locateRequestCounter by remember { mutableIntStateOf(0) }
                 var testCounter by remember { mutableIntStateOf(0) }
 
                 // Dynamically tracks bottom card height so map legend, pills & popups never overlap
@@ -69,7 +71,9 @@ class MainActivity : ComponentActivity() {
                         syncErrorMessage = syncErrorMessage,
                         userLat = userLat,
                         userLng = userLng,
-                        bottomControlsPadding = bottomCardHeightDp + 6.dp
+                        userAccuracyMeters = userAccuracy,
+                        bottomControlsPadding = bottomCardHeightDp + 6.dp,
+                        onRequestMyLocation = { locateRequestCounter++ }
                     )
 
                     // Sleek floating bottom Live Signal & Auto-Recorder card
@@ -81,12 +85,14 @@ class MainActivity : ComponentActivity() {
                                 bottomCardHeightPx = coords.size.height
                             },
                         pendingOfflineCount = pendingOfflineCount,
+                        locateRequestCounter = locateRequestCounter,
                         onReadingCaptured = { reading ->
                             repository.saveReading(reading)
                         },
-                        onLocationUpdated = { lat, lng, _ ->
+                        onLocationUpdated = { lat, lng, accuracy ->
                             userLat = lat
                             userLng = lng
+                            userAccuracy = accuracy
                         },
                         onSendTestReading = {
                             val carriers = listOf("Smart", "Globe", "DITO")

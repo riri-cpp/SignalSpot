@@ -3,7 +3,6 @@ package com.example.signalspot.collector
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
@@ -66,7 +65,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.signalspot.data.SignalReading
 import com.example.signalspot.data.gridKeyFor
 import com.example.signalspot.ui.theme.SignalFairAmber
@@ -82,12 +81,13 @@ import java.util.UUID
 
 private const val MIN_WALK_DISTANCE_METERS = 20f
 private const val MIN_TIME_BETWEEN_SAVES_MS = 10_000L
-private const val MAX_ALLOWED_GPS_ACCURACY_METERS = 30f
+private const val MAX_ALLOWED_SAVE_ACCURACY_METERS = 30f
+private const val MAX_DISPLAY_DOT_ACCURACY_METERS = 150f
 
-// Anti-teleport thresholds
-private const val MAX_LOCATION_AGE_NANOS = 10_000_000_000L
-private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 60f
-private const val MAX_PLAUSIBLE_SPEED_MPS = 12.0 // ~43 km/h
+// Anti-teleport thresholds (30s age window to safely handle slower satellite cold-starts)
+private const val MAX_LOCATION_AGE_MS = 30_000L
+private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 80f
+private const val MAX_PLAUSIBLE_SPEED_MPS = 15.0 // ~54 km/h
 private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 3
 
 // Approximate BSU Alangilan center & campus geofence radius
@@ -168,11 +168,13 @@ fun SignalStrengthBars(
 fun SignalCollectorBottomCard(
     modifier: Modifier = Modifier,
     pendingOfflineCount: Int = 0,
+    locateRequestCounter: Int = 0,
     onReadingCaptured: ((SignalReading) -> Unit)? = null,
     onLocationUpdated: ((lat: Double, lng: Double, accuracy: Float) -> Unit)? = null,
     onSendTestReading: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     val requiredPermissions = remember {
         arrayOf(
@@ -182,9 +184,31 @@ fun SignalCollectorBottomCard(
         )
     }
 
-    var hasPermissions by remember {
-        mutableStateOf(checkAllPermissionsGranted(context, requiredPermissions))
+    var hasFineLocation by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        )
     }
+    var hasCoarseLocation by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    var hasPhonePermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.READ_PHONE_STATE
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val hasAnyLocation = hasFineLocation || hasCoarseLocation
 
     var latestSnapshot by remember { mutableStateOf<RawSignalSnapshot?>(null) }
     var isAutoLogging by remember { mutableStateOf(true) }
@@ -193,63 +217,107 @@ fun SignalCollectorBottomCard(
     var showOptions by remember { mutableStateOf(false) }
 
     var currentLocation by remember { mutableStateOf<Location?>(null) }
-    var lastSavedLocation by remember { mutableStateOf<Location?>(null) }
+    var lastVerifiedSaveLocation by remember { mutableStateOf<Location?>(null) }
     var lastSavedTimeMs by remember { mutableLongStateOf(0L) }
-    var lastHardwareGpsFixTimeMs by remember { mutableLongStateOf(0L) }
+    var lastAccurateGnssFixTimeMs by remember { mutableLongStateOf(0L) }
     var candidateJumpLocation by remember { mutableStateOf<Location?>(null) }
     var candidateJumpCount by remember { mutableIntStateOf(0) }
     var sessionSavedCount by remember { mutableIntStateOf(0) }
-    var gpsStatusText by remember { mutableStateOf("Searching for GPS satellites...") }
+    var gpsStatusText by remember { mutableStateOf("Locating GPS...") }
     var isGpsHealthy by remember { mutableStateOf(false) }
+
+    fun refreshPermissionFlags() {
+        hasFineLocation = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        hasCoarseLocation = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        hasPhonePermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_PHONE_STATE
+        ) == PackageManager.PERMISSION_GRANTED
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissionsMap ->
-        val allGranted = permissionsMap.values.all { it }
-        hasPermissions = allGranted
-        if (allGranted) {
+    ) {
+        refreshPermissionFlags()
+        if (hasFineLocation || hasCoarseLocation) {
             latestSnapshot = readCurrentSignal(context)
-        } else {
-            gpsStatusText = "Location & Phone permissions are required."
+        }
+        if (!hasFineLocation && hasCoarseLocation) {
+            gpsStatusText = "Approximate location only — enable Precise Location for GPS"
+        } else if (!hasFineLocation && !hasCoarseLocation) {
+            gpsStatusText = "Location permission denied"
         }
     }
 
     LaunchedEffect(Unit) {
-        if (hasPermissions) {
+        refreshPermissionFlags()
+        if (hasFineLocation && hasPhonePermission) {
             latestSnapshot = readCurrentSignal(context)
         } else {
             permissionLauncher.launch(requiredPermissions)
         }
     }
 
+    // Immediate fresh GPS ping when user taps "My GPS" on the map
+    LaunchedEffect(locateRequestCounter) {
+        if (locateRequestCounter > 0 && hasAnyLocation) {
+            val fusedClient = LocationServices.getFusedLocationProviderClient(context)
+            try {
+                fusedClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                    .addOnSuccessListener { loc ->
+                        if (loc != null && loc.accuracy in 1f..MAX_DISPLAY_DOT_ACCURACY_METERS) {
+                            currentLocation = loc
+                            onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
+                        }
+                    }
+            } catch (_: SecurityException) {
+            }
+        }
+    }
+
     // Foreground-only GPS listener: starts on RESUME and stops immediately on PAUSE / close (Risk #5)
-    val lifecycleOwner = remember(context) { context.findLifecycleOwner() }
     DisposableEffect(
-        hasPermissions,
+        hasFineLocation,
+        hasCoarseLocation,
         isAutoLogging,
         preferPureSatelliteGps,
         lockToBsuCampusArea,
         lifecycleOwner
     ) {
-        if (!hasPermissions) {
+        if (!hasFineLocation && !hasCoarseLocation) {
             onDispose { }
         } else {
             val fusedClient = LocationServices.getFusedLocationProviderClient(context)
             val locationManager =
                 context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
-            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2500L)
-                .setMinUpdateIntervalMillis(1500L)
-                .setMaxUpdateAgeMillis(5000L)
-                .setWaitForAccurateLocation(true)
+            // Note: Do NOT use setWaitForAccurateLocation(true) as it stalls updates on many phones
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000L)
+                .setMinUpdateIntervalMillis(1000L)
+                .setMaxUpdateAgeMillis(10_000L)
                 .build()
+
+            fun isLocationStale(loc: Location): Boolean {
+                val elapsedNanos = loc.elapsedRealtimeNanos
+                if (elapsedNanos > 0L) {
+                    val ageMs = (SystemClock.elapsedRealtimeNanos() - elapsedNanos) / 1_000_000L
+                    return ageMs > MAX_LOCATION_AGE_MS
+                }
+                val wallAgeMs = System.currentTimeMillis() - loc.time
+                return wallAgeMs > MAX_LOCATION_AGE_MS
+            }
 
             fun handleNewLocation(loc: Location, isFromHardwareGps: Boolean) {
                 val snapshot = readCurrentSignal(context)
                 latestSnapshot = snapshot
 
-                val ageNanos = SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos
-                if (ageNanos > MAX_LOCATION_AGE_NANOS) return
+                if (isLocationStale(loc)) return
 
                 @Suppress("DEPRECATION")
                 if (loc.isFromMockProvider) {
@@ -259,12 +327,21 @@ fun SignalCollectorBottomCard(
                 }
 
                 val nowMs = System.currentTimeMillis()
-                if (isFromHardwareGps) {
-                    lastHardwareGpsFixTimeMs = nowMs
-                } else if (preferPureSatelliteGps && (nowMs - lastHardwareGpsFixTimeMs) < 8_000L) {
+                val isAccurateForSaving =
+                    loc.accuracy > 0f && loc.accuracy <= MAX_ALLOWED_SAVE_ACCURACY_METERS
+
+                // CRITICAL FIX: Only let Hardware GNSS override Fused when GNSS itself is accurate (<=30m)!
+                // Previously, weak indoor GNSS fixes blocked accurate Fused fixes indefinitely.
+                if (isFromHardwareGps && isAccurateForSaving) {
+                    lastAccurateGnssFixTimeMs = nowMs
+                } else if (!isFromHardwareGps &&
+                    preferPureSatelliteGps &&
+                    (nowMs - lastAccurateGnssFixTimeMs) < 8_000L
+                ) {
                     return
                 }
 
+                // Optional BSU Campus Lock Guard
                 if (lockToBsuCampusArea) {
                     val distFromBsu = FloatArray(1)
                     Location.distanceBetween(
@@ -281,25 +358,31 @@ fun SignalCollectorBottomCard(
                     }
                 }
 
-                if (loc.accuracy <= 0f || loc.accuracy > MAX_ALLOWED_GPS_ACCURACY_METERS) {
+                // Reject huge cell-tower jumps (>150m accuracy) completely
+                if (loc.accuracy <= 0f || loc.accuracy > MAX_DISPLAY_DOT_ACCURACY_METERS) {
                     isGpsHealthy = false
                     val holdTag = if (currentLocation != null) " · Holding last spot" else ""
-                    gpsStatusText = "Standby: Weak GPS (±${loc.accuracy.toInt()}m)$holdTag"
+                    gpsStatusText = "Standby: Coarse signal (±${loc.accuracy.toInt()}m)$holdTag"
                     return
                 }
 
+                // Anti-Teleport Velocity Spike Filter (for already-locked users)
                 val prevVerified = currentLocation
                 if (prevVerified != null) {
                     val jumpDist = prevVerified.distanceTo(loc)
-                    val dtSec = ((loc.elapsedRealtimeNanos - prevVerified.elapsedRealtimeNanos) /
-                        1_000_000_000.0).coerceAtLeast(0.5)
+                    val dtSec = if (loc.elapsedRealtimeNanos > 0L && prevVerified.elapsedRealtimeNanos > 0L) {
+                        ((loc.elapsedRealtimeNanos - prevVerified.elapsedRealtimeNanos) / 1_000_000_000.0)
+                            .coerceAtLeast(0.5)
+                    } else {
+                        ((loc.time - prevVerified.time) / 1000.0).coerceAtLeast(0.5)
+                    }
                     val speedMps = jumpDist / dtSec
 
                     if (jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
                         speedMps > MAX_PLAUSIBLE_SPEED_MPS
                     ) {
                         val candidate = candidateJumpLocation
-                        if (candidate != null && candidate.distanceTo(loc) <= 30f) {
+                        if (candidate != null && candidate.distanceTo(loc) <= 40f) {
                             candidateJumpCount++
                         } else {
                             candidateJumpLocation = loc
@@ -318,17 +401,30 @@ fun SignalCollectorBottomCard(
                     }
                 }
 
+                // Always update live blue dot on map for valid fixes (<=150m) so GPS never vanishes!
                 currentLocation = loc
-                isGpsHealthy = true
                 onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
-                val sourceTag = if (isFromHardwareGps) "GNSS" else "Fused"
+                val sourceTag = if (isFromHardwareGps) "GNSS" else "GPS"
+
+                // Enforce strict 30m accuracy gate ONLY for saving heatmap squares (Proposal R1 & Risk #3)
+                if (!isAccurateForSaving) {
+                    isGpsHealthy = false
+                    gpsStatusText = if (!hasFineLocation) {
+                        "Approximate only (±${loc.accuracy.toInt()}m) — Enable Precise GPS"
+                    } else {
+                        "Standby: Weak GPS (±${loc.accuracy.toInt()}m > 30m)"
+                    }
+                    return
+                }
+
+                isGpsHealthy = true
 
                 if (!isAutoLogging) {
                     gpsStatusText = "Paused · $sourceTag ±${loc.accuracy.toInt()}m"
                     return
                 }
 
-                val prevSaved = lastSavedLocation
+                val prevSaved = lastVerifiedSaveLocation
                 val movedMeters = prevSaved?.distanceTo(loc) ?: Float.MAX_VALUE
                 val elapsedMs = nowMs - lastSavedTimeMs
 
@@ -342,10 +438,11 @@ fun SignalCollectorBottomCard(
                         accuracy = loc.accuracy
                     )
                     onReadingCaptured?.invoke(reading)
-                    lastSavedLocation = loc
+                    lastVerifiedSaveLocation = loc
                     lastSavedTimeMs = nowMs
                     sessionSavedCount++
-                    gpsStatusText = "Auto-Recording · Saved #$sessionSavedCount · $sourceTag ±${loc.accuracy.toInt()}m"
+                    gpsStatusText =
+                        "Auto-Recording · Saved #$sessionSavedCount · $sourceTag ±${loc.accuracy.toInt()}m"
                 } else {
                     gpsStatusText =
                         "Auto-Recording · ${movedMeters.toInt()}m/20m · $sourceTag ±${loc.accuracy.toInt()}m"
@@ -371,8 +468,27 @@ fun SignalCollectorBottomCard(
             }
 
             fun startLocationUpdates() {
+                refreshPermissionFlags()
                 try {
-                    if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                    // 1. Request an immediate fresh high-accuracy fix so blue dot shows right away
+                    fusedClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                        .addOnSuccessListener { loc ->
+                            if (loc != null) {
+                                handleNewLocation(loc, isFromHardwareGps = false)
+                            }
+                        }
+
+                    // 2. Continuous Fused High-Accuracy updates
+                    fusedClient.requestLocationUpdates(
+                        locationRequest,
+                        fusedCallback,
+                        Looper.getMainLooper()
+                    )
+
+                    // 3. Direct hardware satellite GPS updates (requires Precise/FINE permission)
+                    if (hasFineLocation &&
+                        locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                    ) {
                         locationManager.requestLocationUpdates(
                             LocationManager.GPS_PROVIDER,
                             2000L,
@@ -380,12 +496,9 @@ fun SignalCollectorBottomCard(
                             hardwareGpsListener,
                             Looper.getMainLooper()
                         )
+                    } else if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                        gpsStatusText = "GPS is OFF — turn on phone Location"
                     }
-                    fusedClient.requestLocationUpdates(
-                        locationRequest,
-                        fusedCallback,
-                        Looper.getMainLooper()
-                    )
                 } catch (_: SecurityException) {
                 }
             }
@@ -406,14 +519,14 @@ fun SignalCollectorBottomCard(
                 }
             }
 
-            if (lifecycleOwner != null) {
-                lifecycleOwner.lifecycle.addObserver(observer)
-            } else {
+            lifecycleOwner.lifecycle.addObserver(observer)
+            // Start immediately if lifecycle is already resumed when effect enters composition
+            if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                 startLocationUpdates()
             }
 
             onDispose {
-                lifecycleOwner?.lifecycle?.removeObserver(observer)
+                lifecycleOwner.lifecycle.removeObserver(observer)
                 stopLocationUpdates()
             }
         }
@@ -440,15 +553,23 @@ fun SignalCollectorBottomCard(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
-            if (!hasPermissions) {
+            if (!hasFineLocation || !hasPhonePermission) {
                 Text(
-                    text = "Permissions Needed",
+                    text = if (hasCoarseLocation && !hasFineLocation) {
+                        "Precise GPS Required"
+                    } else {
+                        "Permissions Needed"
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Allow Location and Phone access to measure live signal and map campus squares.",
+                    text = if (hasCoarseLocation && !hasFineLocation) {
+                        "Approximate location is selected. Please allow \"Precise\" location so SignalSpot can track your exact 22m square."
+                    } else {
+                        "Allow Precise Location and Phone access to measure live signal and map campus squares."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -458,7 +579,13 @@ fun SignalCollectorBottomCard(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Text("Grant Location & Phone Permissions")
+                    Text(
+                        if (hasCoarseLocation && !hasFineLocation) {
+                            "Enable Precise Location"
+                        } else {
+                            "Grant Location & Phone Permissions"
+                        }
+                    )
                 }
             } else {
                 // Row 1: Signal Meter + Carrier/dBm + Wi-Fi Badge
@@ -507,7 +634,6 @@ fun SignalCollectorBottomCard(
                         }
                     }
 
-                    // Wi-Fi pill on right
                     val wifiDbm = snap?.wifiDbm
                     Surface(
                         shape = RoundedCornerShape(10.dp),
@@ -566,20 +692,23 @@ fun SignalCollectorBottomCard(
                             val loc = currentLocation
                             val snapshot = readCurrentSignal(context)
                             latestSnapshot = snapshot
-                            if (loc != null && loc.accuracy <= MAX_ALLOWED_GPS_ACCURACY_METERS) {
+                            if (loc != null && loc.accuracy <= MAX_ALLOWED_SAVE_ACCURACY_METERS) {
                                 val reading = snapshot.toSignalReading(
                                     lat = loc.latitude,
                                     lng = loc.longitude,
                                     accuracy = loc.accuracy
                                 )
                                 onReadingCaptured?.invoke(reading)
-                                lastSavedLocation = loc
+                                lastVerifiedSaveLocation = loc
                                 lastSavedTimeMs = System.currentTimeMillis()
                                 sessionSavedCount++
                                 gpsStatusText =
                                     "Recorded Spot #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
+                            } else if (loc != null) {
+                                gpsStatusText =
+                                    "GPS accuracy is ±${loc.accuracy.toInt()}m (needs ≤30m to record)"
                             } else {
-                                gpsStatusText = "Wait for accurate GPS (≤30m) to record"
+                                gpsStatusText = "Waiting for GPS lock..."
                             }
                         },
                         modifier = Modifier.weight(1f),
@@ -612,7 +741,7 @@ fun SignalCollectorBottomCard(
                     }
                 }
 
-                // Expandable Options Drawer (keeps main UI clean while giving instant access to GPS guards & test tools)
+                // Expandable Options Drawer
                 AnimatedVisibility(visible = showOptions) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Spacer(modifier = Modifier.height(10.dp))
@@ -709,24 +838,6 @@ fun SignalCollectorScreen(
                 onLocationUpdated = onLocationUpdated
             )
         }
-    }
-}
-
-private fun Context.findLifecycleOwner(): LifecycleOwner? {
-    var ctx: Context? = this
-    while (ctx is ContextWrapper) {
-        if (ctx is LifecycleOwner) return ctx
-        ctx = ctx.baseContext
-    }
-    return null
-}
-
-private fun checkAllPermissionsGranted(
-    context: Context,
-    permissions: Array<String>
-): Boolean {
-    return permissions.all { permission ->
-        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 }
 
