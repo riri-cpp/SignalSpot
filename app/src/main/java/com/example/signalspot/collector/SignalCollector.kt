@@ -14,11 +14,23 @@ import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
 import android.telephony.CellSignalStrength
+import android.telephony.CellSignalStrengthCdma
+import android.telephony.CellSignalStrengthGsm
+import android.telephony.CellSignalStrengthLte
+import android.telephony.CellSignalStrengthNr
+import android.telephony.CellSignalStrengthTdscdma
+import android.telephony.CellSignalStrengthWcdma
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -545,7 +557,10 @@ fun SignalCollectorBottomCard(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 10.dp),
         shape = RoundedCornerShape(22.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ),
         elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
     ) {
         Column(
@@ -741,8 +756,14 @@ fun SignalCollectorBottomCard(
                     }
                 }
 
-                // Expandable Options Drawer
-                AnimatedVisibility(visible = showOptions) {
+                // Expandable Options Drawer (matches map panel enter/exit timing)
+                AnimatedVisibility(
+                    visible = showOptions,
+                    enter = fadeIn(tween(240, easing = FastOutSlowInEasing)) +
+                        expandVertically(tween(240, easing = FastOutSlowInEasing)),
+                    exit = fadeOut(tween(200, easing = FastOutSlowInEasing)) +
+                        shrinkVertically(tween(200, easing = FastOutSlowInEasing))
+                ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Spacer(modifier = Modifier.height(10.dp))
                         HorizontalDivider()
@@ -870,19 +891,26 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
     }
     val carrier = normalizeCarrierName(chosenCarrier)
 
-    // 2. Network Type (2G / 3G / 4G / 5G)
-    val networkType = try {
-        mapNetworkTypeToGeneration(telephonyManager.dataNetworkType)
-    } catch (_: SecurityException) {
-        "Unknown"
-    }
-
-    // 3. Signal Strength (0-4 bars and exact dBm)
+    // 2. Signal Strength (0-4 bars and exact dBm)
     val signalStrength = telephonyManager.signalStrength
     val level = (signalStrength?.level ?: 0).coerceIn(0, 4)
 
     val cellSignalList: List<CellSignalStrength> =
         signalStrength?.cellSignalStrengths ?: emptyList()
+
+    // 3. Network Type (2G / 3G / 4G / 5G) with fallback to CellSignalStrength radio type
+    // so network generation still shows accurately even while connected to Wi-Fi!
+    val dataGen = try {
+        mapNetworkTypeToGeneration(telephonyManager.dataNetworkType)
+    } catch (_: SecurityException) {
+        "Unknown"
+    }
+    val networkType = if (dataGen != "Unknown") {
+        dataGen
+    } else {
+        inferGenerationFromCellSignal(cellSignalList)
+    }
+
     val rawDbm = cellSignalList.firstOrNull {
         it.dbm != CellSignalStrength.SIGNAL_STRENGTH_NONE_OR_UNKNOWN && it.dbm != Int.MAX_VALUE
     }?.dbm ?: Int.MAX_VALUE
@@ -907,6 +935,16 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
         wifiDbm = wifiDbm,
         formattedSummary = formattedSummary
     )
+}
+
+private fun inferGenerationFromCellSignal(cellSignals: List<CellSignalStrength>): String {
+    return when {
+        cellSignals.any { it is CellSignalStrengthNr } -> "5G"
+        cellSignals.any { it is CellSignalStrengthLte } -> "4G"
+        cellSignals.any { it is CellSignalStrengthWcdma || it is CellSignalStrengthTdscdma } -> "3G"
+        cellSignals.any { it is CellSignalStrengthGsm || it is CellSignalStrengthCdma } -> "2G"
+        else -> "Unknown"
+    }
 }
 
 private fun normalizeCarrierName(raw: String): String {

@@ -5,8 +5,13 @@ import android.location.Location
 import android.text.format.DateUtils
 import android.view.ViewGroup
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
@@ -69,14 +74,75 @@ import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.MapTileProviderBasic
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
+import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.TilesOverlay
 
 // Approximate center of BatStateU Alangilan.
 private const val CAMPUS_LAT = 13.7847
 private const val CAMPUS_LON = 121.0735
+
+// Shared animation timing across panels and floating controls
+private const val PANEL_ANIM_ENTER_MS = 240
+private const val PANEL_ANIM_EXIT_MS = 200
+
+// Free high-resolution satellite imagery (Esri World Imagery).
+// Verified native Batangas & BSU Alangilan resolution goes up to zoom 18 (zoom 19 is unavailable).
+private val EsriSatelliteTileSource = object : OnlineTileSourceBase(
+    "EsriWorldImageryZ18",
+    0,
+    18,
+    256,
+    ".jpg",
+    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/")
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String {
+        val zoom = MapTileIndex.getZoom(pMapTileIndex)
+        val x = MapTileIndex.getX(pMapTileIndex)
+        val y = MapTileIndex.getY(pMapTileIndex)
+        return "$baseUrl$zoom/$y/$x"
+    }
+}
+
+// Free transparent street & road name labels overlay (Esri World Transportation — no API key)
+private val EsriRoadsLabelsTileSource = object : OnlineTileSourceBase(
+    "EsriWorldTransportationZ18",
+    0,
+    18,
+    256,
+    ".png",
+    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/")
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String {
+        val zoom = MapTileIndex.getZoom(pMapTileIndex)
+        val x = MapTileIndex.getX(pMapTileIndex)
+        val y = MapTileIndex.getY(pMapTileIndex)
+        return "$baseUrl$zoom/$y/$x"
+    }
+}
+
+// Free transparent place & landmark labels overlay (Esri Boundaries & Places — no API key)
+private val EsriPlacesLabelsTileSource = object : OnlineTileSourceBase(
+    "EsriWorldPlacesZ18",
+    0,
+    18,
+    256,
+    ".png",
+    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/")
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String {
+        val zoom = MapTileIndex.getZoom(pMapTileIndex)
+        val x = MapTileIndex.getX(pMapTileIndex)
+        val y = MapTileIndex.getY(pMapTileIndex)
+        return "$baseUrl$zoom/$y/$x"
+    }
+}
 
 private enum class SignalLevel(
     val label: String,
@@ -159,6 +225,7 @@ private fun buildGridSquares(
 private fun buildRealSquarePolygon(
     summary: GridSquareSummary,
     isSelected: Boolean,
+    isSatelliteMode: Boolean,
     onSquareTapped: (GridSquareSummary) -> Unit
 ): Polygon {
     val south = summary.row * GRID_SIZE
@@ -174,12 +241,13 @@ private fun buildRealSquarePolygon(
             GeoPoint(north, west)
         )
         fillPaint.color = summary.level.fillColor
-        outlinePaint.color = if (isSelected) {
-            AndroidColor.rgb(15, 23, 42)
-        } else {
-            AndroidColor.argb(140, 15, 23, 42)
+        outlinePaint.color = when {
+            isSelected && isSatelliteMode -> AndroidColor.WHITE
+            isSelected -> AndroidColor.rgb(15, 23, 42)
+            isSatelliteMode -> AndroidColor.argb(180, 255, 255, 255)
+            else -> AndroidColor.argb(140, 15, 23, 42)
         }
-        outlinePaint.strokeWidth = if (isSelected) 5f else 2f
+        outlinePaint.strokeWidth = if (isSelected) 5.5f else 2f
         setOnClickListener { _, _, _ ->
             onSquareTapped(summary)
             true
@@ -192,7 +260,7 @@ private fun buildUserAccuracyHalo(lat: Double, lng: Double, accuracyMeters: Floa
     return Polygon().apply {
         points = Polygon.pointsAsCircle(GeoPoint(lat, lng), radiusMeters)
         fillPaint.color = AndroidColor.argb(45, 21, 94, 239)
-        outlinePaint.color = AndroidColor.argb(110, 21, 94, 239)
+        outlinePaint.color = AndroidColor.argb(130, 59, 130, 246)
         outlinePaint.strokeWidth = 2f
     }
 }
@@ -206,7 +274,8 @@ private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
     }
 }
 
-private fun moveCameraSmoothly(mapView: MapView, target: GeoPoint, targetZoom: Double = 18.8) {
+private fun moveCameraSmoothly(mapView: MapView, target: GeoPoint, targetZoom: Double = 18.0) {
+    val safeZoom = targetZoom.coerceAtMost(mapView.maxZoomLevel)
     mapView.controller.stopAnimation(false)
     val currentCenter = mapView.mapCenter
     val dist = FloatArray(1)
@@ -217,12 +286,11 @@ private fun moveCameraSmoothly(mapView: MapView, target: GeoPoint, targetZoom: D
         target.longitude,
         dist
     )
-    // If jumping far away (e.g., > 2 km from home to BSU Campus), snap directly to avoid stalls
     if (dist[0] > 2000f) {
-        mapView.controller.setZoom(targetZoom)
+        mapView.controller.setZoom(safeZoom)
         mapView.controller.setCenter(target)
     } else {
-        mapView.controller.animateTo(target, targetZoom, 450L)
+        mapView.controller.animateTo(target, safeZoom, 450L)
     }
     mapView.invalidate()
 }
@@ -247,14 +315,20 @@ fun SignalHeatmapView(
     var selectedCarrier by remember { mutableStateOf("All") }
     var selectedNetwork by remember { mutableStateOf("All") }
     var selectedSquareKey by remember { mutableStateOf<String?>(null) }
+    var isSatelliteMode by remember { mutableStateOf(false) }
     var hasAutoCenteredOnUser by remember { mutableStateOf(false) }
+
+    // Cache last displayed square & notice so exit animations play smoothly instead of snapping!
+    var lastDisplayedSquare by remember { mutableStateOf<GridSquareSummary?>(null) }
     var mapNoticeMessage by remember { mutableStateOf<String?>(null) }
+    var lastNoticeText by remember { mutableStateOf("") }
+
     var popupCardHeightPx by remember { mutableIntStateOf(0) }
     val popupCardHeightDp = with(LocalDensity.current) { popupCardHeightPx.toDp() }
 
-    // Auto-dismiss transient map notices after 3 seconds
     LaunchedEffect(mapNoticeMessage) {
         if (mapNoticeMessage != null) {
+            lastNoticeText = mapNoticeMessage.orEmpty()
             delay(3000L)
             mapNoticeMessage = null
         }
@@ -276,9 +350,52 @@ fun SignalHeatmapView(
             )
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
-            controller.setZoom(18.5)
+            // Keep false so high-DPI phones fetch full native-resolution satellite & street tiles
+            isTilesScaledToDpi = false
+            maxZoomLevel = 19.5
+            zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+            controller.setZoom(18.0)
             controller.setCenter(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
         }
+    }
+
+    // Free transparent road & place name label overlays for Hybrid Satellite View (no API key)
+    val roadsTileProvider = remember(mapView) {
+        MapTileProviderBasic(context.applicationContext, EsriRoadsLabelsTileSource).apply {
+            setTileRequestCompleteHandler(mapView.tileRequestCompleteHandler)
+        }
+    }
+    val placesTileProvider = remember(mapView) {
+        MapTileProviderBasic(context.applicationContext, EsriPlacesLabelsTileSource).apply {
+            setTileRequestCompleteHandler(mapView.tileRequestCompleteHandler)
+        }
+    }
+    val hybridRoadsOverlay = remember(roadsTileProvider) {
+        TilesOverlay(roadsTileProvider, context.applicationContext).apply {
+            loadingBackgroundColor = AndroidColor.TRANSPARENT
+            loadingLineColor = AndroidColor.TRANSPARENT
+        }
+    }
+    val hybridPlacesOverlay = remember(placesTileProvider) {
+        TilesOverlay(placesTileProvider, context.applicationContext).apply {
+            loadingBackgroundColor = AndroidColor.TRANSPARENT
+            loadingLineColor = AndroidColor.TRANSPARENT
+        }
+    }
+
+    // Switch between Street Map (OSM up to Z19.5) and Hybrid Satellite View (Esri crisp native Z18)
+    LaunchedEffect(isSatelliteMode) {
+        if (isSatelliteMode) {
+            mapView.setTileSource(EsriSatelliteTileSource)
+            mapView.maxZoomLevel = 18.0
+            if (mapView.zoomLevelDouble > 18.0) {
+                mapView.controller.setZoom(18.0)
+            }
+        } else {
+            mapView.setTileSource(TileSourceFactory.MAPNIK)
+            mapView.maxZoomLevel = 19.5
+        }
+        mapView.invalidate()
     }
 
     val gridSquares = remember(readings, selectedCarrier, selectedNetwork) {
@@ -287,6 +404,12 @@ fun SignalHeatmapView(
 
     val selectedSquare = remember(gridSquares, selectedSquareKey) {
         gridSquares.firstOrNull { it.gridKey == selectedSquareKey }
+    }
+
+    LaunchedEffect(selectedSquare) {
+        if (selectedSquare != null) {
+            lastDisplayedSquare = selectedSquare
+        }
     }
 
     // Center on user's real GPS position once when first acquired
@@ -299,19 +422,27 @@ fun SignalHeatmapView(
         }
     }
 
-    // Redraw map squares + user GPS halo & dot whenever readings, filters, selection, or GPS changes
-    LaunchedEffect(gridSquares, selectedSquareKey, userLat, userLng, userAccuracyMeters) {
+    // Redraw map squares + hybrid labels + user GPS halo & dot whenever state changes
+    LaunchedEffect(gridSquares, selectedSquareKey, isSatelliteMode, userLat, userLng, userAccuracyMeters) {
         mapView.overlays.clear()
+        // Layer 1 (Hybrid Satellite): Crisp transparent street & place labels on top of imagery
+        if (isSatelliteMode) {
+            mapView.overlays.add(hybridRoadsOverlay)
+            mapView.overlays.add(hybridPlacesOverlay)
+        }
+        // Layer 2: ~22m Signal Heatmap Squares
         gridSquares.forEach { summary ->
             mapView.overlays.add(
                 buildRealSquarePolygon(
                     summary = summary,
-                    isSelected = summary.gridKey == selectedSquareKey
+                    isSelected = summary.gridKey == selectedSquareKey,
+                    isSatelliteMode = isSatelliteMode
                 ) { tapped ->
                     selectedSquareKey = tapped.gridKey
                 }
             )
         }
+        // Layer 3: Live User GPS Accuracy Ring & Blue Dot
         if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
             if (userAccuracyMeters != null && userAccuracyMeters > 0f) {
                 mapView.overlays.add(buildUserAccuracyHalo(userLat, userLng, userAccuracyMeters))
@@ -321,7 +452,7 @@ fun SignalHeatmapView(
         mapView.invalidate()
     }
 
-    DisposableEffect(lifecycleOwner, mapView) {
+    DisposableEffect(lifecycleOwner, mapView, roadsTileProvider, placesTileProvider) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> mapView.onResume()
@@ -335,20 +466,33 @@ fun SignalHeatmapView(
         }
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            roadsTileProvider.detach()
+            placesTileProvider.detach()
             mapView.onDetach()
         }
     }
 
     val hasLiveGps = userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)
-    // Shift floating action buttons cleanly above the comparison card whenever a square is selected
-    val buttonsBottomPadding = if (selectedSquare != null) {
+
+    // Smoothly animate floating controls when panels open, close, expand, or collapse!
+    val targetButtonsBottomPadding = if (selectedSquare != null) {
         bottomControlsPadding + popupCardHeightDp + 8.dp
     } else {
         bottomControlsPadding
     }
+    val animatedButtonsBottomPadding by animateDpAsState(
+        targetValue = targetButtonsBottomPadding,
+        animationSpec = tween(durationMillis = PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing),
+        label = "floatingButtonsPadding"
+    )
+    val animatedPopupBottomPadding by animateDpAsState(
+        targetValue = bottomControlsPadding,
+        animationSpec = tween(durationMillis = PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing),
+        label = "popupBottomPadding"
+    )
 
     Box(modifier = modifier.fillMaxSize()) {
-        // 1. Full-screen OpenStreetMap
+        // 1. Full-screen OpenStreetMap / Satellite Map
         AndroidView(
             factory = { mapView },
             modifier = Modifier.fillMaxSize()
@@ -365,7 +509,8 @@ fun SignalHeatmapView(
         ) {
             Surface(
                 shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 shadowElevation = 6.dp,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -452,7 +597,8 @@ fun SignalHeatmapView(
                             )
                         },
                         colors = FilterChipDefaults.elevatedFilterChipColors(
-                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                            labelColor = MaterialTheme.colorScheme.onSurface,
                             selectedContainerColor = MaterialTheme.colorScheme.primary,
                             selectedLabelColor = MaterialTheme.colorScheme.onPrimary
                         ),
@@ -484,7 +630,8 @@ fun SignalHeatmapView(
                             )
                         },
                         colors = FilterChipDefaults.elevatedFilterChipColors(
-                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                            labelColor = MaterialTheme.colorScheme.onSurface,
                             selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                             selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
                         ),
@@ -493,8 +640,12 @@ fun SignalHeatmapView(
                 }
             }
 
-            // Transient Map Feedback Banner (e.g. "No Strong spots found" or "Locating GPS...")
-            AnimatedVisibility(visible = mapNoticeMessage != null) {
+            // Transient Map Feedback Banner with matching smooth enter & exit animations
+            AnimatedVisibility(
+                visible = mapNoticeMessage != null,
+                enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
+                exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
+            ) {
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = MaterialTheme.colorScheme.inverseSurface,
@@ -502,7 +653,7 @@ fun SignalHeatmapView(
                     shadowElevation = 4.dp
                 ) {
                     Text(
-                        text = mapNoticeMessage.orEmpty(),
+                        text = lastNoticeText,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelMedium
                     )
@@ -510,33 +661,109 @@ fun SignalHeatmapView(
             }
         }
 
-        // 3. Bottom-Left Compact Legend Pill (hidden while square popup covers bottom area)
-        if (selectedSquare == null) {
+        // 3. Bottom-Left Satellite Toggle + Zoom Controls (+/-) + Compact Legend Pill
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 12.dp, bottom = animatedButtonsBottomPadding),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.Start
+        ) {
+            // 1-Tap Satellite / Street Map View Toggle
+            MapPillButton(
+                text = if (isSatelliteMode) "Street Map" else "Satellite",
+                containerColor = if (isSatelliteMode) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+                },
+                contentColor = if (isSatelliteMode) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+                onClick = {
+                    isSatelliteMode = !isSatelliteMode
+                    mapNoticeMessage = if (isSatelliteMode) {
+                        "Switched to Satellite View"
+                    } else {
+                        "Switched to Street View"
+                    }
+                }
+            )
+
+            // Crisp Compose Zoom In / Zoom Out pill stack
             Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 12.dp, bottom = bottomControlsPadding),
                 shape = RoundedCornerShape(14.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
-                shadowElevation = 4.dp
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                shadowElevation = 5.dp
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Surface(
+                        onClick = { mapView.controller.zoomIn() },
+                        color = Color.Transparent,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "+",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.size(width = 28.dp, height = 1.dp))
+                    Surface(
+                        onClick = { mapView.controller.zoomOut() },
+                        color = Color.Transparent,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "−",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Smoothly animated Legend Pill (fades & shrinks cleanly when square popup opens)
+            AnimatedVisibility(
+                visible = selectedSquare == null,
+                enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
+                exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    shadowElevation = 4.dp
                 ) {
-                    LegendDot("Strong", SignalStrongGreen)
-                    LegendDot("Fair", SignalFairAmber)
-                    LegendDot("Weak", SignalWeakRed)
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        LegendDot("Strong", SignalStrongGreen)
+                        LegendDot("Fair", SignalFairAmber)
+                        LegendDot("Weak", SignalWeakRed)
+                    }
                 }
             }
         }
 
-        // 4. Bottom-Right Floating Map Action Pills — ALWAYS visible so user can freely toggle!
+        // 4. Bottom-Right Floating Map Action Pills — always reachable and glide smoothly!
         Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = buttonsBottomPadding),
+                .padding(end = 12.dp, bottom = animatedButtonsBottomPadding),
             verticalArrangement = Arrangement.spacedBy(8.dp),
             horizontalAlignment = Alignment.End
         ) {
@@ -599,22 +826,31 @@ fun SignalHeatmapView(
         }
 
         // 5. Upgraded Square-Tap Carrier Comparison Sheet/Card
+        // Uses cached lastDisplayedSquare so BOTH fade-in/slide-up AND fade-out/slide-down play smoothly!
         AnimatedVisibility(
             visible = selectedSquare != null,
-            enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
-            exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
+            enter = fadeIn(tween(PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing)) +
+                slideInVertically(
+                    animationSpec = tween(PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing),
+                    initialOffsetY = { it / 3 }
+                ),
+            exit = fadeOut(tween(PANEL_ANIM_EXIT_MS, easing = FastOutSlowInEasing)) +
+                slideOutVertically(
+                    animationSpec = tween(PANEL_ANIM_EXIT_MS, easing = FastOutSlowInEasing),
+                    targetOffsetY = { it / 3 }
+                ),
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .padding(start = 12.dp, end = 12.dp, bottom = bottomControlsPadding)
+                .padding(start = 12.dp, end = 12.dp, bottom = animatedPopupBottomPadding)
                 .onGloballyPositioned { coords ->
                     popupCardHeightPx = coords.size.height
                 }
         ) {
-            val tapped = selectedSquare
-            if (tapped != null) {
+            val displaySquare = selectedSquare ?: lastDisplayedSquare
+            if (displaySquare != null) {
                 SquareComparisonCard(
-                    summary = tapped,
+                    summary = displaySquare,
                     onClose = { selectedSquareKey = null }
                 )
             }
@@ -637,7 +873,8 @@ private fun LegendDot(label: String, color: Color) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Medium
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface
         )
     }
 }
@@ -683,7 +920,10 @@ private fun SquareComparisonCard(
 
     Card(
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ),
         elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
