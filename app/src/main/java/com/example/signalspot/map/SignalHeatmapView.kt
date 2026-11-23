@@ -2,26 +2,39 @@ package com.example.signalspot.map
 
 import android.content.Context
 import android.content.ContextWrapper
-import android.graphics.Color
+import android.graphics.Color as AndroidColor
 import android.location.Location
 import android.text.format.DateUtils
 import android.view.ViewGroup
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ElevatedFilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -33,17 +46,26 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.example.signalspot.collector.SignalStrengthBars
 import com.example.signalspot.data.GRID_SIZE
 import com.example.signalspot.data.SignalReading
 import com.example.signalspot.data.gridKeyFor
+import com.example.signalspot.ui.theme.SignalFairAmber
+import com.example.signalspot.ui.theme.SignalStrongGreen
+import com.example.signalspot.ui.theme.SignalWeakRed
 import java.util.Locale
 import kotlin.math.floor
+import kotlin.math.roundToInt
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -54,10 +76,14 @@ import org.osmdroid.views.overlay.Polygon
 private const val CAMPUS_LAT = 13.7847
 private const val CAMPUS_LON = 121.0735
 
-private enum class SignalLevel(val label: String, val fillColor: Int) {
-    STRONG("Strong", Color.argb(120, 0, 200, 90)),     // green
-    FAIR("Fair", Color.argb(120, 255, 170, 0)),        // yellow/orange
-    WEAK("Weak / 2G", Color.argb(120, 230, 30, 30))    // red
+private enum class SignalLevel(
+    val label: String,
+    val fillColor: Int,
+    val composeColor: Color
+) {
+    STRONG("Strong", AndroidColor.argb(125, 22, 163, 74), SignalStrongGreen),
+    FAIR("Fair", AndroidColor.argb(125, 217, 119, 6), SignalFairAmber),
+    WEAK("Weak / 2G", AndroidColor.argb(125, 220, 38, 38), SignalWeakRed)
 }
 
 private data class GridSquareSummary(
@@ -75,11 +101,12 @@ private data class GridSquareSummary(
 
 /**
  * Groups real Firestore [SignalReading] records into ~22 m x 22 m squares (GRID_SIZE = 0.0002)
- * and colors each square per Proposal Part 5A (Strong >= 3.0 bars, Fair 1.5..2.9 bars, Weak < 1.5 or 2G).
+ * filtered by both Carrier and Network Type (Proposal Week 2 & Part 5A).
  */
 private fun buildGridSquares(
     allReadings: List<SignalReading>,
-    carrierFilter: String
+    carrierFilter: String,
+    networkFilter: String
 ): List<GridSquareSummary> {
     val validReadings = allReadings.filter { it.lat != 0.0 || it.lng != 0.0 }
     val groupedAll = validReadings.groupBy { reading ->
@@ -89,10 +116,12 @@ private fun buildGridSquares(
     val summaries = mutableListOf<GridSquareSummary>()
 
     for ((key, squareReadings) in groupedAll) {
-        val filtered = if (carrierFilter == "All") {
-            squareReadings
-        } else {
-            squareReadings.filter { it.carrier.equals(carrierFilter, ignoreCase = true) }
+        val filtered = squareReadings.filter { r ->
+            val carrierMatches =
+                carrierFilter == "All" || r.carrier.equals(carrierFilter, ignoreCase = true)
+            val networkMatches =
+                networkFilter == "All" || r.networkType.equals(networkFilter, ignoreCase = true)
+            carrierMatches && networkMatches
         }
         if (filtered.isEmpty()) continue
 
@@ -127,6 +156,7 @@ private fun buildGridSquares(
 
 private fun buildRealSquarePolygon(
     summary: GridSquareSummary,
+    isSelected: Boolean,
     onSquareTapped: (GridSquareSummary) -> Unit
 ): Polygon {
     val south = summary.row * GRID_SIZE
@@ -142,8 +172,12 @@ private fun buildRealSquarePolygon(
             GeoPoint(north, west)
         )
         fillPaint.color = summary.level.fillColor
-        outlinePaint.color = Color.argb(180, 0, 0, 0)
-        outlinePaint.strokeWidth = 2f
+        outlinePaint.color = if (isSelected) {
+            AndroidColor.rgb(15, 23, 42)
+        } else {
+            AndroidColor.argb(140, 15, 23, 42)
+        }
+        outlinePaint.strokeWidth = if (isSelected) 5f else 2f
         setOnClickListener { _, _, _ ->
             onSquareTapped(summary)
             true
@@ -152,7 +186,7 @@ private fun buildRealSquarePolygon(
 }
 
 private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
-    val delta = 0.00004
+    val delta = 0.000045
     return Polygon().apply {
         points = listOf(
             GeoPoint(lat - delta, lng - delta),
@@ -160,13 +194,12 @@ private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
             GeoPoint(lat + delta, lng + delta),
             GeoPoint(lat + delta, lng - delta)
         )
-        fillPaint.color = Color.argb(230, 30, 120, 255)
-        outlinePaint.color = Color.WHITE
-        outlinePaint.strokeWidth = 4f
+        fillPaint.color = AndroidColor.argb(240, 21, 94, 239)
+        outlinePaint.color = AndroidColor.WHITE
+        outlinePaint.strokeWidth = 5f
     }
 }
 
-// Finds the Activity (which is a LifecycleOwner) behind a Context.
 private fun Context.findLifecycleOwner(): LifecycleOwner? {
     var ctx: Context? = this
     while (ctx is ContextWrapper) {
@@ -180,13 +213,19 @@ private fun Context.findLifecycleOwner(): LifecycleOwner? {
 fun SignalHeatmapView(
     modifier: Modifier = Modifier,
     readings: List<SignalReading> = emptyList(),
+    pendingOfflineCount: Int = 0,
+    syncErrorMessage: String? = null,
     userLat: Double? = null,
-    userLng: Double? = null
+    userLng: Double? = null,
+    bottomControlsPadding: Dp = 12.dp
 ) {
     val context = LocalContext.current
     val carriers = listOf("All", "Smart", "Globe", "DITO")
+    val networks = listOf("All", "5G", "4G", "3G", "2G")
+
     var selectedCarrier by remember { mutableStateOf("All") }
-    var selectedSquare by remember { mutableStateOf<GridSquareSummary?>(null) }
+    var selectedNetwork by remember { mutableStateOf("All") }
+    var selectedSquareKey by remember { mutableStateOf<String?>(null) }
     var hasAutoCenteredOnUser by remember { mutableStateOf(false) }
 
     // Required, or map tiles won't load. remember{} makes it run once.
@@ -210,8 +249,12 @@ fun SignalHeatmapView(
         }
     }
 
-    val gridSquares = remember(readings, selectedCarrier) {
-        buildGridSquares(readings, selectedCarrier)
+    val gridSquares = remember(readings, selectedCarrier, selectedNetwork) {
+        buildGridSquares(readings, selectedCarrier, selectedNetwork)
+    }
+
+    val selectedSquare = remember(gridSquares, selectedSquareKey) {
+        gridSquares.firstOrNull { it.gridKey == selectedSquareKey }
     }
 
     // Center on user's real GPS position once when first acquired
@@ -224,13 +267,16 @@ fun SignalHeatmapView(
         }
     }
 
-    // Redraw map squares whenever Firestore readings, filter, or user location changes
-    LaunchedEffect(gridSquares, userLat, userLng) {
+    // Redraw map squares whenever Firestore readings, filters, selection, or user location changes
+    LaunchedEffect(gridSquares, selectedSquareKey, userLat, userLng) {
         mapView.overlays.clear()
         gridSquares.forEach { summary ->
             mapView.overlays.add(
-                buildRealSquarePolygon(summary) { tapped ->
-                    selectedSquare = tapped
+                buildRealSquarePolygon(
+                    summary = summary,
+                    isSelected = summary.gridKey == selectedSquareKey
+                ) { tapped ->
+                    selectedSquareKey = tapped.gridKey
                 }
             )
         }
@@ -240,7 +286,6 @@ fun SignalHeatmapView(
         mapView.invalidate()
     }
 
-    // Tell the map when the app pauses/resumes, and clean up when done.
     val lifecycleOwner = context.findLifecycleOwner()
     DisposableEffect(lifecycleOwner, mapView) {
         val observer = LifecycleEventObserver { _, event ->
@@ -258,164 +303,470 @@ fun SignalHeatmapView(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        // 1. Full-screen OpenStreetMap
         AndroidView(
             factory = { mapView },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top Filter Bar (Carrier filter chips + Square count)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .align(Alignment.TopStart)
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            carriers.forEach { carrier ->
-                FilterChip(
-                    selected = selectedCarrier == carrier,
-                    onClick = {
-                        selectedCarrier = carrier
-                        selectedSquare = null
-                    },
-                    label = { Text(carrier) }
-                )
-            }
-        }
-
-        // Floating Action Buttons: "My GPS" and "Nearest Strong Spot" (Proposal Objective #3)
+        // 2. Top Floating Header + Carrier & Network Filter Bar
         Column(
             modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            horizontalAlignment = Alignment.End
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            SmallFloatingActionButton(
-                onClick = {
-                    val refLat = userLat ?: mapView.mapCenter.latitude
-                    val refLng = userLng ?: mapView.mapCenter.longitude
-                    val strongSquares = gridSquares.filter { it.level == SignalLevel.STRONG }
-                    val nearest = strongSquares.minByOrNull { sq ->
-                        val results = FloatArray(1)
-                        Location.distanceBetween(refLat, refLng, sq.centerLat, sq.centerLng, results)
-                        results[0]
-                    }
-                    if (nearest != null) {
-                        mapView.controller.animateTo(GeoPoint(nearest.centerLat, nearest.centerLng))
-                        selectedSquare = nearest
-                    }
-                }
+            // Brand + Live Cloud Status Bar
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                shadowElevation = 6.dp,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = "Nearest Strong",
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    style = MaterialTheme.typography.labelSmall
-                )
-            }
-
-            SmallFloatingActionButton(
-                onClick = {
-                    mapView.controller.animateTo(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
-                }
-            ) {
-                Text(
-                    text = "BSU Campus",
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    style = MaterialTheme.typography.labelSmall
-                )
-            }
-
-            if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
-                SmallFloatingActionButton(
-                    onClick = {
-                        mapView.controller.animateTo(GeoPoint(userLat, userLng))
-                    }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "My GPS",
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                        style = MaterialTheme.typography.labelSmall
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                        )
+                        Text(
+                            text = "SignalSpot",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "· ${gridSquares.size} spots",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // Cloud Sync Pill
+                    val (pillText, pillColor) = when {
+                        syncErrorMessage != null -> "Check Rules" to SignalWeakRed
+                        pendingOfflineCount > 0 -> "$pendingOfflineCount Queued" to SignalFairAmber
+                        else -> "Synced (${readings.size})" to SignalStrongGreen
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = pillColor.copy(alpha = 0.14f)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(pillColor)
+                            )
+                            Text(
+                                text = pillText,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = pillColor
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Carrier Filter Row (All | Smart | Globe | DITO)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                carriers.forEach { carrier ->
+                    ElevatedFilterChip(
+                        selected = selectedCarrier == carrier,
+                        onClick = {
+                            selectedCarrier = carrier
+                            selectedSquareKey = null
+                        },
+                        label = {
+                            Text(
+                                text = carrier,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = if (selectedCarrier == carrier) FontWeight.Bold else FontWeight.Medium
+                            )
+                        },
+                        colors = FilterChipDefaults.elevatedFilterChipColors(
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                        ),
+                        elevation = FilterChipDefaults.elevatedFilterChipElevation(elevation = 3.dp)
+                    )
+                }
+            }
+
+            // Network Type Filter Row (All | 5G | 4G | 3G | 2G)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                networks.forEach { net ->
+                    ElevatedFilterChip(
+                        selected = selectedNetwork == net,
+                        onClick = {
+                            selectedNetwork = net
+                            selectedSquareKey = null
+                        },
+                        label = {
+                            Text(
+                                text = if (net == "All") "All Nets" else net,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = if (selectedNetwork == net) FontWeight.Bold else FontWeight.Medium
+                            )
+                        },
+                        colors = FilterChipDefaults.elevatedFilterChipColors(
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ),
+                        elevation = FilterChipDefaults.elevatedFilterChipElevation(elevation = 2.dp)
                     )
                 }
             }
         }
 
-        // Square Tap Popup: Side-by-side Carrier Comparison + Last Updated (Proposal Objective #3 & Risk #6)
-        val tapped = selectedSquare
-        if (tapped != null) {
-            Card(
+        // 3. Bottom-Left Compact Legend Pill (hidden while a square popup is open)
+        if (selectedSquare == null) {
+            Surface(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.BottomCenter)
-                    .padding(10.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+                    .align(Alignment.BottomStart)
+                    .padding(start = 12.dp, bottom = bottomControlsPadding),
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                shadowElevation = 4.dp
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    val latestTime = tapped.allReadingsInSquare.maxOfOrNull { it.timestamp } ?: 0L
-                    val relativeTime = if (latestTime > 0L) {
-                        DateUtils.getRelativeTimeSpanString(
-                            latestTime,
-                            System.currentTimeMillis(),
-                            DateUtils.MINUTE_IN_MILLIS
-                        ).toString()
-                    } else {
-                        "Just now"
-                    }
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    LegendDot("Strong", SignalStrongGreen)
+                    LegendDot("Fair", SignalFairAmber)
+                    LegendDot("Weak", SignalWeakRed)
+                }
+            }
+        }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${tapped.level.label} Square · ${
-                                String.format(Locale.US, "%.1f", tapped.avgBars)
-                            } avg bars (${tapped.filteredReadings.size} readings)",
-                            style = MaterialTheme.typography.titleSmall
-                        )
-                        TextButton(onClick = { selectedSquare = null }) {
-                            Text("Close")
+        // 4. Bottom-Right Floating Map Action Pills
+        if (selectedSquare == null) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 12.dp, bottom = bottomControlsPadding),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                MapPillButton(
+                    text = "Nearest Strong",
+                    containerColor = SignalStrongGreen,
+                    contentColor = Color.White,
+                    onClick = {
+                        val refLat = userLat ?: mapView.mapCenter.latitude
+                        val refLng = userLng ?: mapView.mapCenter.longitude
+                        val strongSquares = gridSquares.filter { it.level == SignalLevel.STRONG }
+                        val nearest = strongSquares.minByOrNull { sq ->
+                            val results = FloatArray(1)
+                            Location.distanceBetween(
+                                refLat,
+                                refLng,
+                                sq.centerLat,
+                                sq.centerLng,
+                                results
+                            )
+                            results[0]
+                        }
+                        if (nearest != null) {
+                            mapView.controller.animateTo(
+                                GeoPoint(nearest.centerLat, nearest.centerLng)
+                            )
+                            selectedSquareKey = nearest.gridKey
                         }
                     }
+                )
 
-                    Text(
-                        text = "Updated $relativeTime · Carrier Comparison:",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    val byCarrier = listOf("Smart", "Globe", "DITO").map { cName ->
-                        val cList = tapped.allReadingsInSquare.filter {
-                            it.carrier.equals(cName, ignoreCase = true)
-                        }
-                        if (cList.isEmpty()) {
-                            "$cName: No data"
-                        } else {
-                            val avgB = String.format(Locale.US, "%.1f", cList.map { it.level }.average())
-                            val validDbms = cList.map { it.dbm }.filter { it < 0 }
-                            val avgD = if (validDbms.isNotEmpty()) "${validDbms.average().toInt()} dBm" else "— dBm"
-                            val net = cList.maxByOrNull { it.timestamp }?.networkType ?: ""
-                            "$cName ($net): $avgB bars ($avgD)"
-                        }
+                MapPillButton(
+                    text = "BSU Campus",
+                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    onClick = {
+                        mapView.controller.animateTo(GeoPoint(CAMPUS_LAT, CAMPUS_LON))
                     }
+                )
 
-                    val wifiReadings = tapped.allReadingsInSquare.mapNotNull { it.wifiDbm }
-                    val wifiSummary = if (wifiReadings.isNotEmpty()) {
-                        "Wi-Fi: ${wifiReadings.average().toInt()} dBm"
-                    } else {
-                        "Wi-Fi: None"
-                    }
-
-                    Text(
-                        text = (byCarrier + wifiSummary).joinToString("\n"),
-                        style = MaterialTheme.typography.bodySmall
+                if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
+                    MapPillButton(
+                        text = "My GPS",
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        onClick = {
+                            mapView.controller.animateTo(GeoPoint(userLat, userLng))
+                        }
                     )
                 }
+            }
+        }
+
+        // 5. Upgraded Square-Tap Carrier Comparison Sheet/Card
+        AnimatedVisibility(
+            visible = selectedSquare != null,
+            enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
+            exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .padding(start = 12.dp, end = 12.dp, bottom = bottomControlsPadding)
+        ) {
+            val tapped = selectedSquare
+            if (tapped != null) {
+                SquareComparisonCard(
+                    summary = tapped,
+                    onClose = { selectedSquareKey = null }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LegendDot(label: String, color: Color) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(color)
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+@Composable
+private fun MapPillButton(
+    text: String,
+    containerColor: Color,
+    contentColor: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = containerColor,
+        contentColor = contentColor,
+        shadowElevation = 5.dp
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+@Composable
+private fun SquareComparisonCard(
+    summary: GridSquareSummary,
+    onClose: () -> Unit
+) {
+    val latestTime = summary.allReadingsInSquare.maxOfOrNull { it.timestamp } ?: 0L
+    val relativeTime = if (latestTime > 0L) {
+        DateUtils.getRelativeTimeSpanString(
+            latestTime,
+            System.currentTimeMillis(),
+            DateUtils.MINUTE_IN_MILLIS
+        ).toString()
+    } else {
+        "Just now"
+    }
+
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = summary.level.composeColor.copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = summary.level.label,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = summary.level.composeColor
+                        )
+                    }
+                    Column {
+                        Text(
+                            text = "${
+                                String.format(Locale.US, "%.1f", summary.avgBars)
+                            } avg bars · ${summary.filteredReadings.size} readings",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Updated $relativeTime",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                TextButton(
+                    onClick = onClose,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text("Close")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Side-by-side structured rows for Smart, Globe, DITO
+            listOf("Smart", "Globe", "DITO").forEach { cName ->
+                val cList = summary.allReadingsInSquare.filter {
+                    it.carrier.equals(cName, ignoreCase = true)
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 3.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = cName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        if (cList.isNotEmpty()) {
+                            val net = cList.maxByOrNull { it.timestamp }?.networkType ?: ""
+                            if (net.isNotBlank()) {
+                                Surface(
+                                    shape = RoundedCornerShape(5.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant
+                                ) {
+                                    Text(
+                                        text = net,
+                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if (cList.isEmpty()) {
+                        Text(
+                            text = "No data yet",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        val avgB = cList.map { it.level }.average()
+                        val validDbms = cList.map { it.dbm }.filter { it < 0 }
+                        val avgD = if (validDbms.isNotEmpty()) {
+                            "${validDbms.average().toInt()} dBm"
+                        } else {
+                            "— dBm"
+                        }
+                        val barColor = when {
+                            avgB >= 3.0 -> SignalStrongGreen
+                            avgB >= 1.5 -> SignalFairAmber
+                            else -> SignalWeakRed
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "${String.format(Locale.US, "%.1f", avgB)} bars ($avgD)",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium
+                            )
+                            SignalStrengthBars(
+                                level = avgB.roundToInt(),
+                                activeColor = barColor
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Wi-Fi row
+            val wifiReadings = summary.allReadingsInSquare.mapNotNull { it.wifiDbm }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Wi-Fi",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (wifiReadings.isNotEmpty()) {
+                        "Avg ${wifiReadings.average().toInt()} dBm (${wifiReadings.size} samples)"
+                    } else {
+                        "No Wi-Fi readings"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }

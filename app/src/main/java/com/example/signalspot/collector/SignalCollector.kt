@@ -19,19 +19,33 @@ import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -43,8 +57,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -52,6 +69,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import com.example.signalspot.data.SignalReading
 import com.example.signalspot.data.gridKeyFor
+import com.example.signalspot.ui.theme.SignalFairAmber
+import com.example.signalspot.ui.theme.SignalStrongGreen
+import com.example.signalspot.ui.theme.SignalWeakRed
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -64,15 +84,13 @@ private const val MIN_WALK_DISTANCE_METERS = 20f
 private const val MIN_TIME_BETWEEN_SAVES_MS = 10_000L
 private const val MAX_ALLOWED_GPS_ACCURACY_METERS = 30f
 
-// Anti-teleport thresholds:
-// Rejects location fixes older than 10 seconds
+// Anti-teleport thresholds
 private const val MAX_LOCATION_AGE_NANOS = 10_000_000_000L
-// Maximum plausible walking/campus movement jump before requiring multi-fix confirmation
 private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 60f
 private const val MAX_PLAUSIBLE_SPEED_MPS = 12.0 // ~43 km/h
 private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 3
 
-// Approximate BSU Alangilan center & campus geofence radius (optional campus guard)
+// Approximate BSU Alangilan center & campus geofence radius
 private const val BSU_CAMPUS_LAT = 13.7847
 private const val BSU_CAMPUS_LON = 121.0735
 private const val BSU_CAMPUS_RADIUS_METERS = 650f
@@ -114,15 +132,45 @@ data class RawSignalSnapshot(
 }
 
 /**
- * Live signal reader + GPS movement-gated auto-logger with Anti-Teleport & Hardware GNSS filtering.
+ * Visual 4-bar cellular signal strength indicator.
+ */
+@Composable
+fun SignalStrengthBars(
+    level: Int,
+    activeColor: Color,
+    modifier: Modifier = Modifier
+) {
+    val clamped = level.coerceIn(0, 4)
+    val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(2.5.dp),
+        verticalAlignment = Alignment.Bottom
+    ) {
+        val heights = listOf(6.dp, 10.dp, 14.dp, 18.dp)
+        heights.forEachIndexed { index, barHeight ->
+            Box(
+                modifier = Modifier
+                    .width(4.5.dp)
+                    .height(barHeight)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(if (index < clamped) activeColor else inactiveColor)
+            )
+        }
+    }
+}
+
+/**
+ * Compact floating bottom live signal & auto-logger card for the single-screen Map-First UI.
  */
 @SuppressLint("MissingPermission")
 @Composable
-fun SignalCollectorScreen(
+fun SignalCollectorBottomCard(
     modifier: Modifier = Modifier,
     pendingOfflineCount: Int = 0,
     onReadingCaptured: ((SignalReading) -> Unit)? = null,
-    onLocationUpdated: ((lat: Double, lng: Double, accuracy: Float) -> Unit)? = null
+    onLocationUpdated: ((lat: Double, lng: Double, accuracy: Float) -> Unit)? = null,
+    onSendTestReading: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
 
@@ -138,14 +186,11 @@ fun SignalCollectorScreen(
         mutableStateOf(checkAllPermissionsGranted(context, requiredPermissions))
     }
 
-    var displayOutput by remember {
-        mutableStateOf("Waiting for permissions...")
-    }
-
+    var latestSnapshot by remember { mutableStateOf<RawSignalSnapshot?>(null) }
     var isAutoLogging by remember { mutableStateOf(true) }
-    // When enabled on campus, prefers pure satellite GPS and blocks out-of-campus cell/hotspot teleports
     var preferPureSatelliteGps by remember { mutableStateOf(true) }
     var lockToBsuCampusArea by remember { mutableStateOf(false) }
+    var showOptions by remember { mutableStateOf(false) }
 
     var currentLocation by remember { mutableStateOf<Location?>(null) }
     var lastSavedLocation by remember { mutableStateOf<Location?>(null) }
@@ -155,6 +200,7 @@ fun SignalCollectorScreen(
     var candidateJumpCount by remember { mutableIntStateOf(0) }
     var sessionSavedCount by remember { mutableIntStateOf(0) }
     var gpsStatusText by remember { mutableStateOf("Searching for GPS satellites...") }
+    var isGpsHealthy by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -162,15 +208,15 @@ fun SignalCollectorScreen(
         val allGranted = permissionsMap.values.all { it }
         hasPermissions = allGranted
         if (allGranted) {
-            displayOutput = readCurrentSignal(context).formattedSummary
+            latestSnapshot = readCurrentSignal(context)
         } else {
-            displayOutput = "Permissions denied. Location and Phone permissions are required."
+            gpsStatusText = "Location & Phone permissions are required."
         }
     }
 
     LaunchedEffect(Unit) {
         if (hasPermissions) {
-            displayOutput = readCurrentSignal(context).formattedSummary
+            latestSnapshot = readCurrentSignal(context)
         } else {
             permissionLauncher.launch(requiredPermissions)
         }
@@ -200,23 +246,18 @@ fun SignalCollectorScreen(
 
             fun handleNewLocation(loc: Location, isFromHardwareGps: Boolean) {
                 val snapshot = readCurrentSignal(context)
-                displayOutput = snapshot.formattedSummary
+                latestSnapshot = snapshot
 
-                // 1. Reject stale cached locations (older than 10 seconds)
                 val ageNanos = SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos
-                if (ageNanos > MAX_LOCATION_AGE_NANOS) {
-                    return
-                }
+                if (ageNanos > MAX_LOCATION_AGE_NANOS) return
 
-                // 2. Reject Mock locations
                 @Suppress("DEPRECATION")
                 if (loc.isFromMockProvider) {
+                    isGpsHealthy = false
                     gpsStatusText = "Rejected mock location fix"
                     return
                 }
 
-                // 3. If hardware satellite GPS is actively providing fixes (within last 8s),
-                // ignore Fused network/Wi-Fi hotspot locations that cause campus teleportation!
                 val nowMs = System.currentTimeMillis()
                 if (isFromHardwareGps) {
                     lastHardwareGpsFixTimeMs = nowMs
@@ -224,8 +265,6 @@ fun SignalCollectorScreen(
                     return
                 }
 
-                // 4. Optional BSU Campus Geofence Guard:
-                // Blocks cell-tower or student-hotspot database teleports outside BSU Alangilan
                 if (lockToBsuCampusArea) {
                     val distFromBsu = FloatArray(1)
                     Location.distanceBetween(
@@ -236,25 +275,19 @@ fun SignalCollectorScreen(
                         distFromBsu
                     )
                     if (distFromBsu[0] > BSU_CAMPUS_RADIUS_METERS) {
-                        gpsStatusText =
-                            "Blocked teleport (${distFromBsu[0].toInt()}m from BSU)"
+                        isGpsHealthy = false
+                        gpsStatusText = "Blocked teleport (${distFromBsu[0].toInt()}m from BSU)"
                         return
                     }
                 }
 
-                // 5. CRITICAL FIX: Check 30m accuracy BEFORE updating currentLocation or moving map!
-                // Previously, cell-tower fixes (accuracy 300m-1500m) updated currentLocation first,
-                // which teleported the blue dot to the cell tower outside campus.
                 if (loc.accuracy <= 0f || loc.accuracy > MAX_ALLOWED_GPS_ACCURACY_METERS) {
-                    val keepLabel = if (currentLocation != null) " · Holding last good spot" else ""
-                    gpsStatusText =
-                        "Standby: Weak GPS (±${loc.accuracy.toInt()}m > 30m)$keepLabel"
+                    isGpsHealthy = false
+                    val holdTag = if (currentLocation != null) " · Holding last spot" else ""
+                    gpsStatusText = "Standby: Weak GPS (±${loc.accuracy.toInt()}m)$holdTag"
                     return
                 }
 
-                // 6. Anti-Teleport / Impossible Velocity Spike Filter:
-                // If a single fix suddenly jumps > 60m at > 12 m/s (e.g. nearby mobile hotspot MAC
-                // registered in another town), reject it unless 3 consecutive accurate fixes confirm it.
                 val prevVerified = currentLocation
                 if (prevVerified != null) {
                     val jumpDist = prevVerified.distanceTo(loc)
@@ -274,11 +307,9 @@ fun SignalCollectorScreen(
                         }
 
                         if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
-                            gpsStatusText =
-                                "Filtered GPS spike (${jumpDist.toInt()}m jump blocked)"
+                            gpsStatusText = "Filtered GPS spike (${jumpDist.toInt()}m jump)"
                             return
                         }
-                        // Confirmed new location after 3 consistent fixes
                         candidateJumpLocation = null
                         candidateJumpCount = 0
                     } else {
@@ -287,13 +318,13 @@ fun SignalCollectorScreen(
                     }
                 }
 
-                // Verified, accurate, non-teleported location!
                 currentLocation = loc
+                isGpsHealthy = true
                 onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
                 val sourceTag = if (isFromHardwareGps) "GNSS" else "Fused"
 
                 if (!isAutoLogging) {
-                    gpsStatusText = "Standby: Paused ($sourceTag ±${loc.accuracy.toInt()}m)"
+                    gpsStatusText = "Paused · $sourceTag ±${loc.accuracy.toInt()}m"
                     return
                 }
 
@@ -314,11 +345,10 @@ fun SignalCollectorScreen(
                     lastSavedLocation = loc
                     lastSavedTimeMs = nowMs
                     sessionSavedCount++
-                    gpsStatusText =
-                        "Auto-Recording ($sourceTag): Saved #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
+                    gpsStatusText = "Auto-Recording · Saved #$sessionSavedCount · $sourceTag ±${loc.accuracy.toInt()}m"
                 } else {
                     gpsStatusText =
-                        "Auto-Recording ($sourceTag): ${movedMeters.toInt()}m / 20m walked (±${loc.accuracy.toInt()}m)"
+                        "Auto-Recording · ${movedMeters.toInt()}m/20m · $sourceTag ±${loc.accuracy.toInt()}m"
                 }
             }
 
@@ -342,7 +372,6 @@ fun SignalCollectorScreen(
 
             fun startLocationUpdates() {
                 try {
-                    // Request direct hardware satellite GPS (immune to cell-tower & student hotspot teleports)
                     if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                         locationManager.requestLocationUpdates(
                             LocationManager.GPS_PROVIDER,
@@ -352,7 +381,6 @@ fun SignalCollectorScreen(
                             Looper.getMainLooper()
                         )
                     }
-                    // Also run Fused High-Accuracy as backup when satellites are still locking
                     fusedClient.requestLocationUpdates(
                         locationRequest,
                         fusedCallback,
@@ -391,93 +419,153 @@ fun SignalCollectorScreen(
         }
     }
 
-    Surface(
-        modifier = modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
+    val snap = latestSnapshot
+    val signalAccentColor = when {
+        snap == null -> MaterialTheme.colorScheme.primary
+        snap.networkType == "2G" || snap.level < 2 -> SignalWeakRed
+        snap.level >= 3 -> SignalStrongGreen
+        else -> SignalFairAmber
+    }
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
     ) {
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
-            Text(
-                text = displayOutput,
-                style = MaterialTheme.typography.titleSmall,
-                textAlign = TextAlign.Center
-            )
-
-            Spacer(modifier = Modifier.height(2.dp))
-
-            val queueTag = if (pendingOfflineCount > 0) " · Offline Queued: $pendingOfflineCount" else ""
-            Text(
-                text = "$gpsStatusText$queueTag",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // Anti-Teleport Protection Chips
-            if (hasPermissions) {
+            if (!hasPermissions) {
+                Text(
+                    text = "Permissions Needed",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Allow Location and Phone access to measure live signal and map campus squares.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { permissionLauncher.launch(requiredPermissions) },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("Grant Location & Phone Permissions")
+                }
+            } else {
+                // Row 1: Signal Meter + Carrier/dBm + Wi-Fi Badge
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    FilterChip(
-                        selected = preferPureSatelliteGps,
-                        onClick = { preferPureSatelliteGps = !preferPureSatelliteGps },
-                        label = { Text("Pure GNSS Priority", style = MaterialTheme.typography.labelSmall) }
-                    )
-                    FilterChip(
-                        selected = lockToBsuCampusArea,
-                        onClick = { lockToBsuCampusArea = !lockToBsuCampusArea },
-                        label = { Text("BSU Campus Lock", style = MaterialTheme.typography.labelSmall) }
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(4.dp))
-            }
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Button(
-                    onClick = {
-                        val grantedNow = checkAllPermissionsGranted(context, requiredPermissions)
-                        hasPermissions = grantedNow
-                        if (grantedNow) {
-                            displayOutput = readCurrentSignal(context).formattedSummary
-                        } else {
-                            permissionLauncher.launch(requiredPermissions)
-                        }
-                    }
-                ) {
-                    Text(text = if (hasPermissions) "Refresh" else "Grant Permissions")
-                }
-
-                if (hasPermissions) {
-                    OutlinedButton(
-                        onClick = {
-                            isAutoLogging = !isAutoLogging
-                            gpsStatusText = if (isAutoLogging) {
-                                "Auto-Recording resumed"
-                            } else {
-                                "Standby: Paused"
-                            }
-                        }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text(text = if (isAutoLogging) "Pause" else "Resume")
+                        SignalStrengthBars(
+                            level = snap?.level ?: 0,
+                            activeColor = signalAccentColor
+                        )
+                        Column {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = snap?.carrier ?: "Reading...",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = signalAccentColor.copy(alpha = 0.14f)
+                                ) {
+                                    Text(
+                                        text = snap?.networkType ?: "--",
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = signalAccentColor
+                                    )
+                                }
+                            }
+                            val dbmLabel = if (snap != null && snap.dbm < 0) "${snap.dbm} dBm" else "— dBm"
+                            Text(
+                                text = "$dbmLabel · ${snap?.level ?: 0}/4 bars",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
 
+                    // Wi-Fi pill on right
+                    val wifiDbm = snap?.wifiDbm
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Text(
+                            text = if (wifiDbm != null) "Wi-Fi $wifiDbm dBm" else "Wi-Fi Off",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Row 2: Live GPS / Auto-Record status indicator
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val dotColor = when {
+                        !isAutoLogging -> SignalFairAmber
+                        isGpsHealthy -> SignalStrongGreen
+                        else -> SignalFairAmber
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(dotColor)
+                    )
+                    val queueSuffix =
+                        if (pendingOfflineCount > 0) " · $pendingOfflineCount queued" else ""
+                    Text(
+                        text = "$gpsStatusText$queueSuffix",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Row 3: Primary Action Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Button(
                         onClick = {
                             val loc = currentLocation
                             val snapshot = readCurrentSignal(context)
-                            displayOutput = snapshot.formattedSummary
+                            latestSnapshot = snapshot
                             if (loc != null && loc.accuracy <= MAX_ALLOWED_GPS_ACCURACY_METERS) {
                                 val reading = snapshot.toSignalReading(
                                     lat = loc.latitude,
@@ -491,15 +579,135 @@ fun SignalCollectorScreen(
                                 gpsStatusText =
                                     "Recorded Spot #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
                             } else {
-                                gpsStatusText =
-                                    "Wait for accurate GPS (≤30m) before recording..."
+                                gpsStatusText = "Wait for accurate GPS (≤30m) to record"
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)
+                    ) {
+                        Text(text = "Record Spot", fontWeight = FontWeight.SemiBold)
+                    }
+
+                    FilledTonalButton(
+                        onClick = {
+                            isAutoLogging = !isAutoLogging
+                            gpsStatusText = if (isAutoLogging) {
+                                "Auto-Recording resumed"
+                            } else {
+                                "Paused · Tap Resume to auto-log"
+                            }
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+                    ) {
+                        Text(text = if (isAutoLogging) "Pause" else "Resume")
+                    }
+
+                    TextButton(
+                        onClick = { showOptions = !showOptions },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
+                    ) {
+                        Text(text = if (showOptions) "Hide" else "Options")
+                    }
+                }
+
+                // Expandable Options Drawer (keeps main UI clean while giving instant access to GPS guards & test tools)
+                AnimatedVisibility(visible = showOptions) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        HorizontalDivider()
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Text(
+                            text = "GPS & Field-Test Controls",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = preferPureSatelliteGps,
+                                onClick = { preferPureSatelliteGps = !preferPureSatelliteGps },
+                                label = {
+                                    Text(
+                                        text = "Pure GNSS",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            )
+                            FilterChip(
+                                selected = lockToBsuCampusArea,
+                                onClick = { lockToBsuCampusArea = !lockToBsuCampusArea },
+                                label = {
+                                    Text(
+                                        text = "BSU Campus Lock",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { latestSnapshot = readCurrentSignal(context) },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(vertical = 8.dp)
+                            ) {
+                                Text("Refresh Signal", style = MaterialTheme.typography.labelMedium)
+                            }
+                            if (onSendTestReading != null) {
+                                OutlinedButton(
+                                    onClick = onSendTestReading,
+                                    modifier = Modifier.weight(1f),
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(vertical = 8.dp)
+                                ) {
+                                    Text("Send Test Reading", style = MaterialTheme.typography.labelMedium)
+                                }
                             }
                         }
-                    ) {
-                        Text(text = "Record Spot")
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * Standalone wrapper preserved for Member 1 testing compatibility.
+ */
+@Composable
+fun SignalCollectorScreen(
+    modifier: Modifier = Modifier,
+    pendingOfflineCount: Int = 0,
+    onReadingCaptured: ((SignalReading) -> Unit)? = null,
+    onLocationUpdated: ((lat: Double, lng: Double, accuracy: Float) -> Unit)? = null
+) {
+    Surface(
+        modifier = modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            SignalCollectorBottomCard(
+                pendingOfflineCount = pendingOfflineCount,
+                onReadingCaptured = onReadingCaptured,
+                onLocationUpdated = onLocationUpdated
+            )
         }
     }
 }
@@ -578,7 +786,6 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
     val wifiDbm = readConnectedWifiDbm(appContext)
     val wifiDisplay = if (wifiDbm != null) "$wifiDbm dBm" else "Not connected"
 
-    // Target output format: Smart · 4G · -92 dBm · 3 bars · Wi-Fi: -61 dBm
     val formattedSummary = "$carrier · $networkType · $dbmDisplay · $level bars · Wi-Fi: $wifiDisplay"
 
     return RawSignalSnapshot(
