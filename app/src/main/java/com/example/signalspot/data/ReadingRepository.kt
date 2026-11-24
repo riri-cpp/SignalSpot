@@ -51,7 +51,7 @@ class ReadingRepository(
     }
 
     /**
-     * Listens in real time to the newest 800 readings ordered by timestamp (newest first).
+     * Listens in real time to the newest 5,000 readings ordered by timestamp (newest first).
      */
     fun listenToReadings(onUpdate: (List<SignalReading>) -> Unit): ListenerRegistration {
         return listenToReadingsWithStatus { readings, _, _ ->
@@ -92,7 +92,7 @@ class ReadingRepository(
 
     companion object {
         private const val COLLECTION_READINGS = "readings"
-        private const val MAX_READINGS_LIMIT = 800L
+        private const val MAX_READINGS_LIMIT = 5000L
     }
 }
 

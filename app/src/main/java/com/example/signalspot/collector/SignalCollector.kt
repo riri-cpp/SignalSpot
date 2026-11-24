@@ -228,9 +228,38 @@ fun SignalCollectorBottomCard(
     var lockToBsuCampusArea by remember { mutableStateOf(false) }
     var showOptions by remember { mutableStateOf(false) }
 
+    // Persist the last saved GPS anchor across app minimizes/reopens so reopening SignalSpot
+    // while standing still does not spam duplicate readings into Firebase
+    val savePrefs = remember(context) {
+        context.applicationContext.getSharedPreferences("signalspot_last_save", Context.MODE_PRIVATE)
+    }
+
     var currentLocation by remember { mutableStateOf<Location?>(null) }
-    var lastVerifiedSaveLocation by remember { mutableStateOf<Location?>(null) }
-    var lastSavedTimeMs by remember { mutableLongStateOf(0L) }
+    var lastVerifiedSaveLocation by remember {
+        mutableStateOf(
+            if (savePrefs.contains("lat") && savePrefs.contains("lng")) {
+                Location("saved_anchor").apply {
+                    latitude = Double.fromBits(savePrefs.getLong("lat", 0L))
+                    longitude = Double.fromBits(savePrefs.getLong("lng", 0L))
+                }
+            } else {
+                null
+            }
+        )
+    }
+    var lastSavedTimeMs by remember {
+        mutableLongStateOf(savePrefs.getLong("time_ms", 0L))
+    }
+
+    fun persistLastSavedAnchor(loc: Location, timeMs: Long) {
+        lastVerifiedSaveLocation = loc
+        lastSavedTimeMs = timeMs
+        savePrefs.edit()
+            .putLong("lat", loc.latitude.toRawBits())
+            .putLong("lng", loc.longitude.toRawBits())
+            .putLong("time_ms", timeMs)
+            .apply()
+    }
     var lastAccurateGnssFixTimeMs by remember { mutableLongStateOf(0L) }
     var candidateJumpLocation by remember { mutableStateOf<Location?>(null) }
     var candidateJumpCount by remember { mutableIntStateOf(0) }
@@ -450,8 +479,7 @@ fun SignalCollectorBottomCard(
                         accuracy = loc.accuracy
                     )
                     onReadingCaptured?.invoke(reading)
-                    lastVerifiedSaveLocation = loc
-                    lastSavedTimeMs = nowMs
+                    persistLastSavedAnchor(loc, nowMs)
                     sessionSavedCount++
                     gpsStatusText =
                         "Auto-Recording · Saved #$sessionSavedCount · $sourceTag ±${loc.accuracy.toInt()}m"
@@ -714,8 +742,7 @@ fun SignalCollectorBottomCard(
                                     accuracy = loc.accuracy
                                 )
                                 onReadingCaptured?.invoke(reading)
-                                lastVerifiedSaveLocation = loc
-                                lastSavedTimeMs = System.currentTimeMillis()
+                                persistLastSavedAnchor(loc, System.currentTimeMillis())
                                 sessionSavedCount++
                                 gpsStatusText =
                                     "Recorded Spot #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
