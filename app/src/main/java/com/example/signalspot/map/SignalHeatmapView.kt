@@ -5,6 +5,7 @@ import android.location.Location
 import android.text.format.DateUtils
 import android.view.ViewGroup
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -142,6 +143,13 @@ private val EsriPlacesLabelsTileSource = object : OnlineTileSourceBase(
         val y = MapTileIndex.getY(pMapTileIndex)
         return "$baseUrl$zoom/$y/$x"
     }
+}
+
+private enum class MapFocusMode {
+    NONE,
+    NEAREST_STRONG,
+    BSU_CAMPUS,
+    MY_GPS
 }
 
 private enum class SignalLevel(
@@ -321,6 +329,7 @@ fun SignalHeatmapView(
     var selectedCarrier by remember { mutableStateOf("All") }
     var selectedNetwork by remember { mutableStateOf("All") }
     var selectedSquareKey by remember { mutableStateOf<String?>(null) }
+    var activeFocusMode by remember { mutableStateOf(MapFocusMode.BSU_CAMPUS) }
     var isSatelliteMode by remember { mutableStateOf(false) }
     var hasAutoCenteredOnUser by remember { mutableStateOf(false) }
 
@@ -424,6 +433,7 @@ fun SignalHeatmapView(
             (userLat != 0.0 || userLng != 0.0)
         ) {
             moveCameraSmoothly(mapView, GeoPoint(userLat, userLng), 18.8)
+            activeFocusMode = MapFocusMode.MY_GPS
             hasAutoCenteredOnUser = true
         }
     }
@@ -765,7 +775,7 @@ fun SignalHeatmapView(
             }
         }
 
-        // 4. Bottom-Right Floating Map Action Pills — always reachable and glide smoothly!
+        // 4. Bottom-Right Floating Map Action Pills — uniform theme surface, highlighted when selected!
         Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
@@ -773,10 +783,9 @@ fun SignalHeatmapView(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             horizontalAlignment = Alignment.End
         ) {
-            MapPillButton(
+            SelectableMapPillButton(
                 text = "Nearest Strong",
-                containerColor = SignalStrongGreen,
-                contentColor = Color.White,
+                selected = activeFocusMode == MapFocusMode.NEAREST_STRONG,
                 onClick = {
                     val refLat = if (hasLiveGps) userLat else mapView.mapCenter.latitude
                     val refLng = if (hasLiveGps) userLng else mapView.mapCenter.longitude
@@ -793,6 +802,7 @@ fun SignalHeatmapView(
                         results[0]
                     }
                     if (nearest != null) {
+                        activeFocusMode = MapFocusMode.NEAREST_STRONG
                         moveCameraSmoothly(
                             mapView,
                             GeoPoint(nearest.centerLat, nearest.centerLng),
@@ -805,21 +815,21 @@ fun SignalHeatmapView(
                 }
             )
 
-            MapPillButton(
+            SelectableMapPillButton(
                 text = "BSU Campus",
-                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
+                selected = activeFocusMode == MapFocusMode.BSU_CAMPUS,
                 onClick = {
+                    activeFocusMode = MapFocusMode.BSU_CAMPUS
                     selectedSquareKey = null
                     moveCameraSmoothly(mapView, GeoPoint(CAMPUS_LAT, CAMPUS_LON), 18.5)
                 }
             )
 
-            MapPillButton(
+            SelectableMapPillButton(
                 text = if (hasLiveGps) "My GPS" else "Find GPS",
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
+                selected = activeFocusMode == MapFocusMode.MY_GPS,
                 onClick = {
+                    activeFocusMode = MapFocusMode.MY_GPS
                     selectedSquareKey = null
                     onRequestMyLocation?.invoke()
                     if (hasLiveGps) {
@@ -857,7 +867,12 @@ fun SignalHeatmapView(
             if (displaySquare != null) {
                 SquareComparisonCard(
                     summary = displaySquare,
-                    onClose = { selectedSquareKey = null }
+                    onClose = {
+                        selectedSquareKey = null
+                        if (activeFocusMode == MapFocusMode.NEAREST_STRONG) {
+                            activeFocusMode = MapFocusMode.NONE
+                        }
+                    }
                 )
             }
         }
@@ -883,6 +898,38 @@ private fun LegendDot(label: String, color: Color) {
             color = MaterialTheme.colorScheme.onSurface
         )
     }
+}
+
+@Composable
+private fun SelectableMapPillButton(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val containerColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+        },
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "pillContainerColor"
+    )
+    val contentColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        },
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "pillContentColor"
+    )
+    MapPillButton(
+        text = text,
+        containerColor = containerColor,
+        contentColor = contentColor,
+        onClick = onClick
+    )
 }
 
 @Composable
