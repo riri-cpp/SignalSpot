@@ -98,9 +98,9 @@ private const val MAX_DISPLAY_DOT_ACCURACY_METERS = 150f
 
 // Anti-teleport thresholds (30s age window to safely handle slower satellite cold-starts)
 private const val MAX_LOCATION_AGE_MS = 30_000L
-private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 80f
-private const val MAX_PLAUSIBLE_SPEED_MPS = 15.0 // ~54 km/h
-private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 3
+private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 100f
+private const val MAX_PLAUSIBLE_SPEED_MPS = 20.0 // ~72 km/h
+private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 2
 
 // Approximate BSU Alangilan center & campus geofence radius
 private const val BSU_CAMPUS_LAT = 13.7847
@@ -407,9 +407,11 @@ fun SignalCollectorBottomCard(
                     return
                 }
 
-                // Anti-Teleport Velocity Spike Filter (for already-locked users)
+                // Anti-Teleport Velocity Spike Filter:
+                // Only filter sudden impossible jumps away from an ALREADY-ACCURATE (<=30m) fix.
+                // Never block an accurate fix (<=30m) that is refining a rough/stale initial fix!
                 val prevVerified = currentLocation
-                if (prevVerified != null) {
+                if (prevVerified != null && prevVerified.accuracy <= MAX_ALLOWED_SAVE_ACCURACY_METERS) {
                     val jumpDist = prevVerified.distanceTo(loc)
                     val dtSec = if (loc.elapsedRealtimeNanos > 0L && prevVerified.elapsedRealtimeNanos > 0L) {
                         ((loc.elapsedRealtimeNanos - prevVerified.elapsedRealtimeNanos) / 1_000_000_000.0)
@@ -419,27 +421,38 @@ fun SignalCollectorBottomCard(
                     }
                     val speedMps = jumpDist / dtSec
 
-                    if (jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
+                    // Ignore spike check if >15s passed (e.g. walked through a building and exited)
+                    if (dtSec <= 15.0 &&
+                        jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
                         speedMps > MAX_PLAUSIBLE_SPEED_MPS
                     ) {
-                        val candidate = candidateJumpLocation
-                        if (candidate != null && candidate.distanceTo(loc) <= 40f) {
-                            candidateJumpCount++
-                        } else {
-                            candidateJumpLocation = loc
-                            candidateJumpCount = 1
-                        }
+                        // Only let accurate fixes count toward confirming a real location change
+                        if (isAccurateForSaving) {
+                            val candidate = candidateJumpLocation
+                            if (candidate != null && candidate.distanceTo(loc) <= 50f) {
+                                candidateJumpCount++
+                            } else {
+                                candidateJumpLocation = loc
+                                candidateJumpCount = 1
+                            }
 
-                        if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
-                            gpsStatusText = "Filtered GPS spike (${jumpDist.toInt()}m jump)"
+                            if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
+                                gpsStatusText = "Filtered GPS spike (${jumpDist.toInt()}m jump)"
+                                return
+                            }
+                            candidateJumpLocation = null
+                            candidateJumpCount = 0
+                        } else {
+                            // Silently ignore coarse network jump without resetting a real candidate
                             return
                         }
-                        candidateJumpLocation = null
-                        candidateJumpCount = 0
                     } else {
                         candidateJumpLocation = null
                         candidateJumpCount = 0
                     }
+                } else {
+                    candidateJumpLocation = null
+                    candidateJumpCount = 0
                 }
 
                 // Always update live blue dot on map for valid fixes (<=150m) so GPS never vanishes!
