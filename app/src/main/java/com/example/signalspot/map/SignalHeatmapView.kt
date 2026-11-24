@@ -262,6 +262,9 @@ private fun buildUserAccuracyHalo(lat: Double, lng: Double, accuracyMeters: Floa
         fillPaint.color = AndroidColor.argb(45, 21, 94, 239)
         outlinePaint.color = AndroidColor.argb(130, 59, 130, 246)
         outlinePaint.strokeWidth = 2f
+        infoWindow = null
+        // Return false so taps inside the blue accuracy halo pass straight through to the squares below!
+        setOnClickListener { _, _, _ -> false }
     }
 }
 
@@ -271,6 +274,9 @@ private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
         fillPaint.color = AndroidColor.argb(245, 21, 94, 239)
         outlinePaint.color = AndroidColor.WHITE
         outlinePaint.strokeWidth = 5f
+        infoWindow = null
+        // Return false so taps on the blue GPS dot pass through to the square underneath!
+        setOnClickListener { _, _, _ -> false }
     }
 }
 
