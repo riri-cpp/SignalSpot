@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Broadcast cell tower icon -->
+    <path
+        android:fillColor="#072540"
+        android:pathData="M12,9.5 A1.6,1.6 0 1 0 12,12.7 A1.6,1.6 0 1 0 12,9.5 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,12.5 L8.5,20.5 M12,12.5 L15.5,20.5 M9.7,17.8 L14.3,17.8"
+        android:strokeWidth="1.9"
+        android:strokeColor="#072540"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M8.8,8.1 A4.5,4.5 0 0 0 8.8,14.1 M15.2,8.1 A4.5,4.5 0 0 1 15.2,14.1"
+        android:strokeWidth="1.8"
+        android:strokeColor="#00A8B5"
+        android:strokeLineCap="round" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M6.2,5.5 A8,8 0 0 0 6.2,16.7 M17.8,5.5 A8,8 0 0 1 17.8,16.7"
+        android:strokeWidth="1.8"
+        android:strokeColor="#00A8B5"
+        android:strokeLineCap="round" />
+</vector>

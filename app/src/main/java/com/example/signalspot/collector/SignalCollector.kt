@@ -31,6 +31,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,16 +48,16 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -71,6 +72,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -78,6 +80,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.signalspot.R
 import com.example.signalspot.data.SignalReading
 import com.example.signalspot.data.gridKeyFor
 import com.example.signalspot.ui.theme.SignalFairAmber
@@ -98,9 +101,9 @@ private const val MAX_DISPLAY_DOT_ACCURACY_METERS = 150f
 
 // Anti-teleport thresholds (30s age window to safely handle slower satellite cold-starts)
 private const val MAX_LOCATION_AGE_MS = 30_000L
-private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 80f
-private const val MAX_PLAUSIBLE_SPEED_MPS = 15.0 // ~54 km/h
-private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 3
+private const val TELEPORT_DISTANCE_THRESHOLD_METERS = 100f
+private const val MAX_PLAUSIBLE_SPEED_MPS = 20.0 // ~72 km/h
+private const val REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP = 2
 
 // Approximate BSU Alangilan center & campus geofence radius
 private const val BSU_CAMPUS_LAT = 13.7847
@@ -144,7 +147,7 @@ data class RawSignalSnapshot(
 }
 
 /**
- * Visual 4-bar cellular signal strength indicator.
+ * Visual 4-bar cellular signal strength indicator matching the SignalSpot mockup aesthetic.
  */
 @Composable
 fun SignalStrengthBars(
@@ -153,19 +156,19 @@ fun SignalStrengthBars(
     modifier: Modifier = Modifier
 ) {
     val clamped = level.coerceIn(0, 4)
-    val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)
+    val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.14f)
     Row(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(2.5.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.Bottom
     ) {
-        val heights = listOf(6.dp, 10.dp, 14.dp, 18.dp)
+        val heights = listOf(8.dp, 13.dp, 18.dp, 24.dp)
         heights.forEachIndexed { index, barHeight ->
             Box(
                 modifier = Modifier
-                    .width(4.5.dp)
+                    .width(5.5.dp)
                     .height(barHeight)
-                    .clip(RoundedCornerShape(2.dp))
+                    .clip(RoundedCornerShape(2.5.dp))
                     .background(if (index < clamped) activeColor else inactiveColor)
             )
         }
@@ -173,14 +176,21 @@ fun SignalStrengthBars(
 }
 
 /**
- * Compact floating bottom live signal & auto-logger card for the single-screen Map-First UI.
+ * Sleek floating bottom Live Signal & Auto-Logger card styled after the SignalSpot mockups.
  */
 @SuppressLint("MissingPermission")
 @Composable
 fun SignalCollectorBottomCard(
     modifier: Modifier = Modifier,
+    isCardVisible: Boolean = true,
+    showOptions: Boolean = false,
+    onToggleShowOptions: ((Boolean) -> Unit)? = null,
     pendingOfflineCount: Int = 0,
     locateRequestCounter: Int = 0,
+    preferPureSatelliteGps: Boolean = true,
+    lockToBsuCampusArea: Boolean = false,
+    onTogglePureGnss: ((Boolean) -> Unit)? = null,
+    onToggleBsuCampusLock: ((Boolean) -> Unit)? = null,
     onReadingCaptured: ((SignalReading) -> Unit)? = null,
     onLocationUpdated: ((lat: Double, lng: Double, accuracy: Float) -> Unit)? = null,
     onSendTestReading: (() -> Unit)? = null
@@ -224,13 +234,44 @@ fun SignalCollectorBottomCard(
 
     var latestSnapshot by remember { mutableStateOf<RawSignalSnapshot?>(null) }
     var isAutoLogging by remember { mutableStateOf(true) }
-    var preferPureSatelliteGps by remember { mutableStateOf(true) }
-    var lockToBsuCampusArea by remember { mutableStateOf(false) }
-    var showOptions by remember { mutableStateOf(false) }
+    var localShowOptions by remember { mutableStateOf(showOptions) }
+    val effectiveShowOptions = if (onToggleShowOptions != null) showOptions else localShowOptions
+    val setShowOptions: (Boolean) -> Unit = { next ->
+        if (onToggleShowOptions != null) onToggleShowOptions(next) else localShowOptions = next
+    }
+
+    // Persist last saved GPS anchor so reopening while standing still doesn't spam duplicates
+    val savePrefs = remember(context) {
+        context.applicationContext.getSharedPreferences("signalspot_last_save", Context.MODE_PRIVATE)
+    }
 
     var currentLocation by remember { mutableStateOf<Location?>(null) }
-    var lastVerifiedSaveLocation by remember { mutableStateOf<Location?>(null) }
-    var lastSavedTimeMs by remember { mutableLongStateOf(0L) }
+    var lastVerifiedSaveLocation by remember {
+        mutableStateOf(
+            if (savePrefs.contains("lat") && savePrefs.contains("lng")) {
+                Location("saved_anchor").apply {
+                    latitude = Double.fromBits(savePrefs.getLong("lat", 0L))
+                    longitude = Double.fromBits(savePrefs.getLong("lng", 0L))
+                }
+            } else {
+                null
+            }
+        )
+    }
+    var lastSavedTimeMs by remember {
+        mutableLongStateOf(savePrefs.getLong("time_ms", 0L))
+    }
+
+    fun persistLastSavedAnchor(loc: Location, timeMs: Long) {
+        lastVerifiedSaveLocation = loc
+        lastSavedTimeMs = timeMs
+        savePrefs.edit()
+            .putLong("lat", loc.latitude.toRawBits())
+            .putLong("lng", loc.longitude.toRawBits())
+            .putLong("time_ms", timeMs)
+            .apply()
+    }
+
     var lastAccurateGnssFixTimeMs by remember { mutableLongStateOf(0L) }
     var candidateJumpLocation by remember { mutableStateOf<Location?>(null) }
     var candidateJumpCount by remember { mutableIntStateOf(0) }
@@ -261,7 +302,7 @@ fun SignalCollectorBottomCard(
             latestSnapshot = readCurrentSignal(context)
         }
         if (!hasFineLocation && hasCoarseLocation) {
-            gpsStatusText = "Approximate location only — enable Precise Location for GPS"
+            gpsStatusText = "Approximate location only — enable Precise Location"
         } else if (!hasFineLocation && !hasCoarseLocation) {
             gpsStatusText = "Location permission denied"
         }
@@ -276,7 +317,6 @@ fun SignalCollectorBottomCard(
         }
     }
 
-    // Immediate fresh GPS ping when user taps "My GPS" on the map
     LaunchedEffect(locateRequestCounter) {
         if (locateRequestCounter > 0 && hasAnyLocation) {
             val fusedClient = LocationServices.getFusedLocationProviderClient(context)
@@ -293,7 +333,6 @@ fun SignalCollectorBottomCard(
         }
     }
 
-    // Foreground-only GPS listener: starts on RESUME and stops immediately on PAUSE / close (Risk #5)
     DisposableEffect(
         hasFineLocation,
         hasCoarseLocation,
@@ -309,7 +348,6 @@ fun SignalCollectorBottomCard(
             val locationManager =
                 context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
-            // Note: Do NOT use setWaitForAccurateLocation(true) as it stalls updates on many phones
             val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000L)
                 .setMinUpdateIntervalMillis(1000L)
                 .setMaxUpdateAgeMillis(10_000L)
@@ -342,8 +380,6 @@ fun SignalCollectorBottomCard(
                 val isAccurateForSaving =
                     loc.accuracy > 0f && loc.accuracy <= MAX_ALLOWED_SAVE_ACCURACY_METERS
 
-                // CRITICAL FIX: Only let Hardware GNSS override Fused when GNSS itself is accurate (<=30m)!
-                // Previously, weak indoor GNSS fixes blocked accurate Fused fixes indefinitely.
                 if (isFromHardwareGps && isAccurateForSaving) {
                     lastAccurateGnssFixTimeMs = nowMs
                 } else if (!isFromHardwareGps &&
@@ -353,7 +389,6 @@ fun SignalCollectorBottomCard(
                     return
                 }
 
-                // Optional BSU Campus Lock Guard
                 if (lockToBsuCampusArea) {
                     val distFromBsu = FloatArray(1)
                     Location.distanceBetween(
@@ -370,7 +405,6 @@ fun SignalCollectorBottomCard(
                     }
                 }
 
-                // Reject huge cell-tower jumps (>150m accuracy) completely
                 if (loc.accuracy <= 0f || loc.accuracy > MAX_DISPLAY_DOT_ACCURACY_METERS) {
                     isGpsHealthy = false
                     val holdTag = if (currentLocation != null) " · Holding last spot" else ""
@@ -378,9 +412,8 @@ fun SignalCollectorBottomCard(
                     return
                 }
 
-                // Anti-Teleport Velocity Spike Filter (for already-locked users)
                 val prevVerified = currentLocation
-                if (prevVerified != null) {
+                if (prevVerified != null && prevVerified.accuracy <= MAX_ALLOWED_SAVE_ACCURACY_METERS) {
                     val jumpDist = prevVerified.distanceTo(loc)
                     val dtSec = if (loc.elapsedRealtimeNanos > 0L && prevVerified.elapsedRealtimeNanos > 0L) {
                         ((loc.elapsedRealtimeNanos - prevVerified.elapsedRealtimeNanos) / 1_000_000_000.0)
@@ -390,35 +423,41 @@ fun SignalCollectorBottomCard(
                     }
                     val speedMps = jumpDist / dtSec
 
-                    if (jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
+                    if (dtSec <= 15.0 &&
+                        jumpDist > TELEPORT_DISTANCE_THRESHOLD_METERS &&
                         speedMps > MAX_PLAUSIBLE_SPEED_MPS
                     ) {
-                        val candidate = candidateJumpLocation
-                        if (candidate != null && candidate.distanceTo(loc) <= 40f) {
-                            candidateJumpCount++
-                        } else {
-                            candidateJumpLocation = loc
-                            candidateJumpCount = 1
-                        }
+                        if (isAccurateForSaving) {
+                            val candidate = candidateJumpLocation
+                            if (candidate != null && candidate.distanceTo(loc) <= 50f) {
+                                candidateJumpCount++
+                            } else {
+                                candidateJumpLocation = loc
+                                candidateJumpCount = 1
+                            }
 
-                        if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
-                            gpsStatusText = "Filtered GPS spike (${jumpDist.toInt()}m jump)"
+                            if (candidateJumpCount < REQUIRED_CONSECUTIVE_FIXES_FOR_LARGE_JUMP) {
+                                gpsStatusText = "Filtered GPS spike (${jumpDist.toInt()}m jump)"
+                                return
+                            }
+                            candidateJumpLocation = null
+                            candidateJumpCount = 0
+                        } else {
                             return
                         }
-                        candidateJumpLocation = null
-                        candidateJumpCount = 0
                     } else {
                         candidateJumpLocation = null
                         candidateJumpCount = 0
                     }
+                } else {
+                    candidateJumpLocation = null
+                    candidateJumpCount = 0
                 }
 
-                // Always update live blue dot on map for valid fixes (<=150m) so GPS never vanishes!
                 currentLocation = loc
                 onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.accuracy)
                 val sourceTag = if (isFromHardwareGps) "GNSS" else "GPS"
 
-                // Enforce strict 30m accuracy gate ONLY for saving heatmap squares (Proposal R1 & Risk #3)
                 if (!isAccurateForSaving) {
                     isGpsHealthy = false
                     gpsStatusText = if (!hasFineLocation) {
@@ -450,8 +489,7 @@ fun SignalCollectorBottomCard(
                         accuracy = loc.accuracy
                     )
                     onReadingCaptured?.invoke(reading)
-                    lastVerifiedSaveLocation = loc
-                    lastSavedTimeMs = nowMs
+                    persistLastSavedAnchor(loc, nowMs)
                     sessionSavedCount++
                     gpsStatusText =
                         "Auto-Recording · Saved #$sessionSavedCount · $sourceTag ±${loc.accuracy.toInt()}m"
@@ -482,7 +520,6 @@ fun SignalCollectorBottomCard(
             fun startLocationUpdates() {
                 refreshPermissionFlags()
                 try {
-                    // 1. Request an immediate fresh high-accuracy fix so blue dot shows right away
                     fusedClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
                         .addOnSuccessListener { loc ->
                             if (loc != null) {
@@ -490,14 +527,12 @@ fun SignalCollectorBottomCard(
                             }
                         }
 
-                    // 2. Continuous Fused High-Accuracy updates
                     fusedClient.requestLocationUpdates(
                         locationRequest,
                         fusedCallback,
                         Looper.getMainLooper()
                     )
 
-                    // 3. Direct hardware satellite GPS updates (requires Precise/FINE permission)
                     if (hasFineLocation &&
                         locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
                     ) {
@@ -532,7 +567,6 @@ fun SignalCollectorBottomCard(
             }
 
             lifecycleOwner.lifecycle.addObserver(observer)
-            // Start immediately if lifecycle is already resumed when effect enters composition
             if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                 startLocationUpdates()
             }
@@ -552,22 +586,43 @@ fun SignalCollectorBottomCard(
         else -> SignalFairAmber
     }
 
+    // Keep GPS & signal engine alive even while the visual card smoothly hides for a square sheet!
+    AnimatedVisibility(
+        visible = isCardVisible,
+        enter = fadeIn(tween(220, easing = FastOutSlowInEasing)) +
+            expandVertically(tween(220, easing = FastOutSlowInEasing)),
+        exit = fadeOut(tween(180, easing = FastOutSlowInEasing)) +
+            shrinkVertically(tween(180, easing = FastOutSlowInEasing))
+    ) {
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        shape = RoundedCornerShape(22.dp),
+            .padding(horizontal = 14.dp),
+        shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface
         ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
+            // Sleek mockup sheet handle
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .width(38.dp)
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.14f))
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
             if (!hasFineLocation || !hasPhonePermission) {
                 Text(
                     text = if (hasCoarseLocation && !hasFineLocation) {
@@ -576,12 +631,12 @@ fun SignalCollectorBottomCard(
                         "Permissions Needed"
                     },
                     style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
+                    fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = if (hasCoarseLocation && !hasFineLocation) {
-                        "Approximate location is selected. Please allow \"Precise\" location so SignalSpot can track your exact 22m square."
+                        "Approximate location is selected. Allow \"Precise\" location to map exact 22m squares."
                     } else {
                         "Allow Precise Location and Phone access to measure live signal and map campus squares."
                     },
@@ -592,18 +647,19 @@ fun SignalCollectorBottomCard(
                 Button(
                     onClick = { permissionLauncher.launch(requiredPermissions) },
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
+                    shape = RoundedCornerShape(24.dp)
                 ) {
                     Text(
                         if (hasCoarseLocation && !hasFineLocation) {
                             "Enable Precise Location"
                         } else {
                             "Grant Location & Phone Permissions"
-                        }
+                        },
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             } else {
-                // Row 1: Signal Meter + Carrier/dBm + Wi-Fi Badge
+                // Row 1: Signal Meter + Carrier/Badge/dBm + Wi-Fi Pill with custom icon
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -611,7 +667,7 @@ fun SignalCollectorBottomCard(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         SignalStrengthBars(
                             level = snap?.level ?: 0,
@@ -628,15 +684,15 @@ fun SignalCollectorBottomCard(
                                     fontWeight = FontWeight.Bold
                                 )
                                 Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = signalAccentColor.copy(alpha = 0.14f)
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.primary
                                 ) {
                                     Text(
                                         text = snap?.networkType ?: "--",
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
                                         style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = signalAccentColor
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onPrimary
                                     )
                                 }
                             }
@@ -649,28 +705,47 @@ fun SignalCollectorBottomCard(
                         }
                     }
 
+                    // Wi-Fi pill with ic_wifi_on / ic_wifi_off
                     val wifiDbm = snap?.wifiDbm
                     Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
+                        shape = RoundedCornerShape(20.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = MaterialTheme.colorScheme.onSurface
                     ) {
-                        Text(
-                            text = if (wifiDbm != null) "Wi-Fi $wifiDbm dBm" else "Wi-Fi Off",
+                        Row(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(
+                                painter = painterResource(
+                                    if (wifiDbm != null) R.drawable.ic_wifi_on else R.drawable.ic_wifi_off
+                                ),
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                                tint = if (wifiDbm != null) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                            Text(
+                                text = if (wifiDbm != null) "$wifiDbm dBm" else "Wi-Fi Off",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(9.dp))
 
                 // Row 2: Live GPS / Auto-Record status indicator
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
                     val dotColor = when {
                         !isAutoLogging -> SignalFairAmber
@@ -694,9 +769,9 @@ fun SignalCollectorBottomCard(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(11.dp))
 
-                // Row 3: Primary Action Row
+                // Row 3: Mockup-styled Rounded Pill Action Row (Record Spot | Pause | Options)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -714,8 +789,7 @@ fun SignalCollectorBottomCard(
                                     accuracy = loc.accuracy
                                 )
                                 onReadingCaptured?.invoke(reading)
-                                lastVerifiedSaveLocation = loc
-                                lastSavedTimeMs = System.currentTimeMillis()
+                                persistLastSavedAnchor(loc, System.currentTimeMillis())
                                 sessionSavedCount++
                                 gpsStatusText =
                                     "Recorded Spot #$sessionSavedCount (±${loc.accuracy.toInt()}m)"
@@ -726,14 +800,30 @@ fun SignalCollectorBottomCard(
                                 gpsStatusText = "Waiting for GPS lock..."
                             }
                         },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1.25f),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)
                     ) {
-                        Text(text = "Record Spot", fontWeight = FontWeight.SemiBold)
+                        Icon(
+                            painter = painterResource(R.drawable.ic_record_circle),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Record Spot",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1
+                        )
                     }
 
-                    FilledTonalButton(
+                    Surface(
                         onClick = {
                             isAutoLogging = !isAutoLogging
                             gpsStatusText = if (isAutoLogging) {
@@ -742,23 +832,67 @@ fun SignalCollectorBottomCard(
                                 "Paused · Tap Resume to auto-log"
                             }
                         },
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+                        shape = RoundedCornerShape(24.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = MaterialTheme.colorScheme.onSurface
                     ) {
-                        Text(text = if (isAutoLogging) "Pause" else "Resume")
+                        Row(
+                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(
+                                painter = painterResource(
+                                    if (isAutoLogging) R.drawable.ic_pause_bars else R.drawable.ic_play_arrow
+                                ),
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = if (isAutoLogging) "Pause" else "Resume",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
 
-                    TextButton(
-                        onClick = { showOptions = !showOptions },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
+                    Surface(
+                        onClick = { setShowOptions(!effectiveShowOptions) },
+                        shape = RoundedCornerShape(24.dp),
+                        color = if (effectiveShowOptions) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        },
+                        contentColor = if (effectiveShowOptions) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
                     ) {
-                        Text(text = if (showOptions) "Hide" else "Options")
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_more_dots),
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (effectiveShowOptions) "Hide" else "Options",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
 
                 // Expandable Options Drawer (matches map panel enter/exit timing)
                 AnimatedVisibility(
-                    visible = showOptions,
+                    visible = effectiveShowOptions,
                     enter = fadeIn(tween(240, easing = FastOutSlowInEasing)) +
                         expandVertically(tween(240, easing = FastOutSlowInEasing)),
                     exit = fadeOut(tween(200, easing = FastOutSlowInEasing)) +
@@ -783,7 +917,7 @@ fun SignalCollectorBottomCard(
                         ) {
                             FilterChip(
                                 selected = preferPureSatelliteGps,
-                                onClick = { preferPureSatelliteGps = !preferPureSatelliteGps },
+                                onClick = { onTogglePureGnss?.invoke(!preferPureSatelliteGps) },
                                 label = {
                                     Text(
                                         text = "Pure GNSS",
@@ -793,7 +927,7 @@ fun SignalCollectorBottomCard(
                             )
                             FilterChip(
                                 selected = lockToBsuCampusArea,
-                                onClick = { lockToBsuCampusArea = !lockToBsuCampusArea },
+                                onClick = { onToggleBsuCampusLock?.invoke(!lockToBsuCampusArea) },
                                 label = {
                                     Text(
                                         text = "BSU Campus Lock",
@@ -812,7 +946,7 @@ fun SignalCollectorBottomCard(
                             OutlinedButton(
                                 onClick = { latestSnapshot = readCurrentSignal(context) },
                                 modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(10.dp),
+                                shape = RoundedCornerShape(12.dp),
                                 contentPadding = PaddingValues(vertical = 8.dp)
                             ) {
                                 Text("Refresh Signal", style = MaterialTheme.typography.labelMedium)
@@ -821,7 +955,7 @@ fun SignalCollectorBottomCard(
                                 OutlinedButton(
                                     onClick = onSendTestReading,
                                     modifier = Modifier.weight(1f),
-                                    shape = RoundedCornerShape(10.dp),
+                                    shape = RoundedCornerShape(12.dp),
                                     contentPadding = PaddingValues(vertical = 8.dp)
                                 ) {
                                     Text("Send Test Reading", style = MaterialTheme.typography.labelMedium)
@@ -832,6 +966,7 @@ fun SignalCollectorBottomCard(
                 }
             }
         }
+    }
     }
 }
 
@@ -872,8 +1007,6 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
     val baseTelephonyManager =
         appContext.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
 
-    // CRITICAL DUAL-SIM FIX FOR API 29:
-    // Reads from the active mobile data SIM without using API 30's getActiveDataSubscriptionId()
     val dataSubId = SubscriptionManager.getDefaultDataSubscriptionId()
     val telephonyManager = if (dataSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
         baseTelephonyManager.createForSubscriptionId(dataSubId)
@@ -881,7 +1014,6 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
         baseTelephonyManager
     }
 
-    // 1. Carrier Name (normalized to Globe / Smart / DITO when recognized)
     val rawCarrier = telephonyManager.networkOperatorName?.trim().orEmpty()
     val simCarrier = telephonyManager.simOperatorName?.trim().orEmpty()
     val chosenCarrier = when {
@@ -891,15 +1023,12 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
     }
     val carrier = normalizeCarrierName(chosenCarrier)
 
-    // 2. Signal Strength (0-4 bars and exact dBm)
     val signalStrength = telephonyManager.signalStrength
     val level = (signalStrength?.level ?: 0).coerceIn(0, 4)
 
     val cellSignalList: List<CellSignalStrength> =
         signalStrength?.cellSignalStrengths ?: emptyList()
 
-    // 3. Network Type (2G / 3G / 4G / 5G) with fallback to CellSignalStrength radio type
-    // so network generation still shows accurately even while connected to Wi-Fi!
     val dataGen = try {
         mapNetworkTypeToGeneration(telephonyManager.dataNetworkType)
     } catch (_: SecurityException) {
@@ -915,13 +1044,10 @@ fun readCurrentSignal(context: Context): RawSignalSnapshot {
         it.dbm != CellSignalStrength.SIGNAL_STRENGTH_NONE_OR_UNKNOWN && it.dbm != Int.MAX_VALUE
     }?.dbm ?: Int.MAX_VALUE
 
-    // INVALID DBM FALLBACK:
-    // If exact dBm returns 2147483647 (Int.MAX_VALUE) or is invalid, fall back to "—" for dBm
     val isDbmValid = rawDbm != Int.MAX_VALUE && rawDbm < 0
     val dbmDisplay = if (isDbmValid) "$rawDbm dBm" else "— dBm"
     val cleanDbmValue = if (isDbmValid) rawDbm else 0
 
-    // 4. Wi-Fi Signal Reading
     val wifiDbm = readConnectedWifiDbm(appContext)
     val wifiDisplay = if (wifiDbm != null) "$wifiDbm dBm" else "Not connected"
 

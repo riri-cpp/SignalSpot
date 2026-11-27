@@ -4,7 +4,9 @@ import android.graphics.Color as AndroidColor
 import android.location.Location
 import android.text.format.DateUtils
 import android.view.ViewGroup
+import androidx.annotation.DrawableRes
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -14,12 +16,13 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,18 +31,17 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ElevatedFilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -55,13 +57,20 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.signalspot.R
 import com.example.signalspot.collector.SignalStrengthBars
 import com.example.signalspot.data.GRID_SIZE
 import com.example.signalspot.data.SignalReading
@@ -92,8 +101,7 @@ private const val CAMPUS_LON = 121.0735
 private const val PANEL_ANIM_ENTER_MS = 240
 private const val PANEL_ANIM_EXIT_MS = 200
 
-// Free high-resolution satellite imagery (Esri World Imagery).
-// Verified native Batangas & BSU Alangilan resolution goes up to zoom 18 (zoom 19 is unavailable).
+// Free high-resolution satellite imagery (Esri World Imagery, verified crisp up to Z18 in Batangas)
 private val EsriSatelliteTileSource = object : OnlineTileSourceBase(
     "EsriWorldImageryZ18",
     0,
@@ -144,14 +152,21 @@ private val EsriPlacesLabelsTileSource = object : OnlineTileSourceBase(
     }
 }
 
+private enum class MapFocusMode {
+    NONE,
+    NEAREST_STRONG,
+    BSU_CAMPUS,
+    MY_GPS
+}
+
 private enum class SignalLevel(
     val label: String,
     val fillColor: Int,
     val composeColor: Color
 ) {
-    STRONG("Strong", AndroidColor.argb(125, 22, 163, 74), SignalStrongGreen),
-    FAIR("Fair", AndroidColor.argb(125, 217, 119, 6), SignalFairAmber),
-    WEAK("Weak / 2G", AndroidColor.argb(125, 220, 38, 38), SignalWeakRed)
+    STRONG("Strong", AndroidColor.argb(128, 18, 183, 106), SignalStrongGreen),
+    FAIR("Fair", AndroidColor.argb(128, 245, 158, 11), SignalFairAmber),
+    WEAK("Weak / 2G", AndroidColor.argb(128, 239, 68, 68), SignalWeakRed)
 }
 
 private data class GridSquareSummary(
@@ -243,11 +258,11 @@ private fun buildRealSquarePolygon(
         fillPaint.color = summary.level.fillColor
         outlinePaint.color = when {
             isSelected && isSatelliteMode -> AndroidColor.WHITE
-            isSelected -> AndroidColor.rgb(15, 23, 42)
+            isSelected -> AndroidColor.rgb(7, 37, 64)
             isSatelliteMode -> AndroidColor.argb(180, 255, 255, 255)
-            else -> AndroidColor.argb(140, 15, 23, 42)
+            else -> AndroidColor.argb(120, 7, 37, 64)
         }
-        outlinePaint.strokeWidth = if (isSelected) 5.5f else 2f
+        outlinePaint.strokeWidth = if (isSelected) 5.5f else 1.8f
         setOnClickListener { _, _, _ ->
             onSquareTapped(summary)
             true
@@ -259,9 +274,12 @@ private fun buildUserAccuracyHalo(lat: Double, lng: Double, accuracyMeters: Floa
     val radiusMeters = accuracyMeters.toDouble().coerceIn(8.0, 150.0)
     return Polygon().apply {
         points = Polygon.pointsAsCircle(GeoPoint(lat, lng), radiusMeters)
-        fillPaint.color = AndroidColor.argb(45, 21, 94, 239)
-        outlinePaint.color = AndroidColor.argb(130, 59, 130, 246)
+        fillPaint.color = AndroidColor.argb(42, 0, 158, 168)
+        outlinePaint.color = AndroidColor.argb(130, 0, 168, 181)
         outlinePaint.strokeWidth = 2f
+        infoWindow = null
+        // Pass taps straight through to squares underneath!
+        setOnClickListener { _, _, _ -> false }
     }
 }
 
@@ -271,6 +289,9 @@ private fun buildUserLocationDot(lat: Double, lng: Double): Polygon {
         fillPaint.color = AndroidColor.argb(245, 21, 94, 239)
         outlinePaint.color = AndroidColor.WHITE
         outlinePaint.strokeWidth = 5f
+        infoWindow = null
+        // Pass taps straight through to squares underneath!
+        setOnClickListener { _, _, _ -> false }
     }
 }
 
@@ -305,7 +326,11 @@ fun SignalHeatmapView(
     userLng: Double? = null,
     userAccuracyMeters: Float? = null,
     bottomControlsPadding: Dp = 12.dp,
-    onRequestMyLocation: (() -> Unit)? = null
+    navBarOnlyPadding: Dp = bottomControlsPadding,
+    isBottomOptionsOpen: Boolean = false,
+    onSquareSelectionChanged: ((Boolean) -> Unit)? = null,
+    onRequestMyLocation: (() -> Unit)? = null,
+    onOpenSettings: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -315,16 +340,19 @@ fun SignalHeatmapView(
     var selectedCarrier by remember { mutableStateOf("All") }
     var selectedNetwork by remember { mutableStateOf("All") }
     var selectedSquareKey by remember { mutableStateOf<String?>(null) }
+    var activeFocusMode by remember { mutableStateOf(MapFocusMode.BSU_CAMPUS) }
     var isSatelliteMode by remember { mutableStateOf(false) }
     var hasAutoCenteredOnUser by remember { mutableStateOf(false) }
 
-    // Cache last displayed square & notice so exit animations play smoothly instead of snapping!
+    // Cache last displayed square & notice so exit animations play smoothly
     var lastDisplayedSquare by remember { mutableStateOf<GridSquareSummary?>(null) }
     var mapNoticeMessage by remember { mutableStateOf<String?>(null) }
     var lastNoticeText by remember { mutableStateOf("") }
 
     var popupCardHeightPx by remember { mutableIntStateOf(0) }
     val popupCardHeightDp = with(LocalDensity.current) { popupCardHeightPx.toDp() }
+    var topHeaderHeightPx by remember { mutableIntStateOf(0) }
+    val topHeaderHeightDp = with(LocalDensity.current) { topHeaderHeightPx.toDp() }
 
     LaunchedEffect(mapNoticeMessage) {
         if (mapNoticeMessage != null) {
@@ -334,7 +362,6 @@ fun SignalHeatmapView(
         }
     }
 
-    // Required, or map tiles won't load. remember{} makes it run once.
     remember {
         Configuration.getInstance().apply {
             load(context, context.getSharedPreferences("osmdroid", 0))
@@ -350,7 +377,6 @@ fun SignalHeatmapView(
             )
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
-            // Keep false so high-DPI phones fetch full native-resolution satellite & street tiles
             isTilesScaledToDpi = false
             maxZoomLevel = 19.5
             zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
@@ -359,12 +385,13 @@ fun SignalHeatmapView(
         }
     }
 
-    // Free transparent road & place name label overlays for Hybrid Satellite View (no API key)
+    @Suppress("DEPRECATION")
     val roadsTileProvider = remember(mapView) {
         MapTileProviderBasic(context.applicationContext, EsriRoadsLabelsTileSource).apply {
             setTileRequestCompleteHandler(mapView.tileRequestCompleteHandler)
         }
     }
+    @Suppress("DEPRECATION")
     val placesTileProvider = remember(mapView) {
         MapTileProviderBasic(context.applicationContext, EsriPlacesLabelsTileSource).apply {
             setTileRequestCompleteHandler(mapView.tileRequestCompleteHandler)
@@ -383,16 +410,17 @@ fun SignalHeatmapView(
         }
     }
 
-    // Switch between Street Map (OSM up to Z19.5) and Hybrid Satellite View (Esri crisp native Z18)
     LaunchedEffect(isSatelliteMode) {
         if (isSatelliteMode) {
             mapView.setTileSource(EsriSatelliteTileSource)
+            mapView.setMultiTouchControls(false)
+            mapView.minZoomLevel = 18.0
             mapView.maxZoomLevel = 18.0
-            if (mapView.zoomLevelDouble > 18.0) {
-                mapView.controller.setZoom(18.0)
-            }
+            mapView.controller.setZoom(18.0)
         } else {
             mapView.setTileSource(TileSourceFactory.MAPNIK)
+            mapView.setMultiTouchControls(true)
+            mapView.minZoomLevel = 4.0
             mapView.maxZoomLevel = 19.5
         }
         mapView.invalidate()
@@ -410,27 +438,25 @@ fun SignalHeatmapView(
         if (selectedSquare != null) {
             lastDisplayedSquare = selectedSquare
         }
+        onSquareSelectionChanged?.invoke(selectedSquare != null)
     }
 
-    // Center on user's real GPS position once when first acquired
     LaunchedEffect(userLat, userLng) {
         if (!hasAutoCenteredOnUser && userLat != null && userLng != null &&
             (userLat != 0.0 || userLng != 0.0)
         ) {
             moveCameraSmoothly(mapView, GeoPoint(userLat, userLng), 18.8)
+            activeFocusMode = MapFocusMode.MY_GPS
             hasAutoCenteredOnUser = true
         }
     }
 
-    // Redraw map squares + hybrid labels + user GPS halo & dot whenever state changes
     LaunchedEffect(gridSquares, selectedSquareKey, isSatelliteMode, userLat, userLng, userAccuracyMeters) {
         mapView.overlays.clear()
-        // Layer 1 (Hybrid Satellite): Crisp transparent street & place labels on top of imagery
         if (isSatelliteMode) {
             mapView.overlays.add(hybridRoadsOverlay)
             mapView.overlays.add(hybridPlacesOverlay)
         }
-        // Layer 2: ~22m Signal Heatmap Squares
         gridSquares.forEach { summary ->
             mapView.overlays.add(
                 buildRealSquarePolygon(
@@ -442,7 +468,6 @@ fun SignalHeatmapView(
                 }
             )
         }
-        // Layer 3: Live User GPS Accuracy Ring & Blue Dot
         if (userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)) {
             if (userAccuracyMeters != null && userAccuracyMeters > 0f) {
                 mapView.overlays.add(buildUserAccuracyHalo(userLat, userLng, userAccuracyMeters))
@@ -474,9 +499,10 @@ fun SignalHeatmapView(
 
     val hasLiveGps = userLat != null && userLng != null && (userLat != 0.0 || userLng != 0.0)
 
-    // Smoothly animate floating controls when panels open, close, expand, or collapse!
+    // When a square comparison card is open, it sits right above the nav bar (replacing the bottom live card),
+    // so there is NEVER a double-stacked card pushing controls into the top filter bar!
     val targetButtonsBottomPadding = if (selectedSquare != null) {
-        bottomControlsPadding + popupCardHeightDp + 8.dp
+        navBarOnlyPadding + popupCardHeightDp + 10.dp
     } else {
         bottomControlsPadding
     }
@@ -486,38 +512,46 @@ fun SignalHeatmapView(
         label = "floatingButtonsPadding"
     )
     val animatedPopupBottomPadding by animateDpAsState(
-        targetValue = bottomControlsPadding,
+        targetValue = navBarOnlyPadding,
         animationSpec = tween(durationMillis = PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing),
         label = "popupBottomPadding"
     )
 
     Box(modifier = modifier.fillMaxSize()) {
-        // 1. Full-screen OpenStreetMap / Satellite Map
+        // 1. Full-screen OpenStreetMap / Hybrid Satellite Map
         AndroidView(
             factory = { mapView },
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Top Floating Header + Carrier & Network Filter Bar
+        // 2. Top Floating Brand Header + Mockup-Styled Filter Pills + Circular Map Tools
+        val floatingBorder =
+            BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
+                .onGloballyPositioned { coords ->
+                    topHeaderHeightPx = coords.size.height
+                }
                 .statusBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            // Sleek Branded Header Pill (Logo + Two-Tone SignalSpot + Sync Pill + Gear)
             Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
                 contentColor = MaterialTheme.colorScheme.onSurface,
-                shadowElevation = 6.dp,
+                border = floatingBorder,
+                shadowElevation = 9.dp,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -525,229 +559,308 @@ fun SignalHeatmapView(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(10.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary)
+                        Image(
+                            painter = painterResource(R.drawable.ic_signalspot_logo),
+                            contentDescription = "SignalSpot Logo",
+                            modifier = Modifier.size(30.dp)
                         )
                         Text(
-                            text = "SignalSpot",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "· ${gridSquares.size} spots",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            text = buildAnnotatedString {
+                                withStyle(
+                                    SpanStyle(
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                ) {
+                                    append("Signal")
+                                }
+                                withStyle(
+                                    SpanStyle(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                ) {
+                                    append("Spot")
+                                }
+                            },
+                            fontSize = 18.sp
                         )
                     }
 
-                    val (pillText, pillColor) = when {
-                        syncErrorMessage != null -> "Check Rules" to SignalWeakRed
-                        pendingOfflineCount > 0 -> "$pendingOfflineCount Queued" to SignalFairAmber
-                        else -> "Synced (${readings.size})" to SignalStrongGreen
-                    }
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = pillColor.copy(alpha = 0.14f)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        val (pillText, pillColor) = when {
+                            syncErrorMessage != null -> "Check Rules" to SignalWeakRed
+                            pendingOfflineCount > 0 -> "$pendingOfflineCount Queued" to SignalFairAmber
+                            else -> "Synced (${readings.size})" to SignalStrongGreen
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = pillColor.copy(alpha = 0.14f)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(pillColor)
-                            )
-                            Text(
-                                text = pillText,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                color = pillColor
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(pillColor)
+                                )
+                                Text(
+                                    text = pillText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = pillColor
+                                )
+                            }
+                        }
+
+                        if (onOpenSettings != null) {
+                            Surface(
+                                onClick = onOpenSettings,
+                                shape = CircleShape,
+                                color = Color.Transparent,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_settings_gear),
+                                        contentDescription = "Settings",
+                                        modifier = Modifier.size(20.dp),
+                                        tint = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Carrier Filter Row (All | Smart | Globe | DITO)
+            // Carrier Filter Row (All | Smart | Globe | DITO) — evenly balanced rounded pills
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 carriers.forEach { carrier ->
-                    ElevatedFilterChip(
+                    SleekFilterPill(
+                        label = carrier,
                         selected = selectedCarrier == carrier,
+                        modifier = Modifier.weight(1f),
                         onClick = {
                             selectedCarrier = carrier
                             selectedSquareKey = null
-                        },
-                        label = {
-                            Text(
-                                text = carrier,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (selectedCarrier == carrier) FontWeight.Bold else FontWeight.Medium
-                            )
-                        },
-                        colors = FilterChipDefaults.elevatedFilterChipColors(
-                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
-                            labelColor = MaterialTheme.colorScheme.onSurface,
-                            selectedContainerColor = MaterialTheme.colorScheme.primary,
-                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary
-                        ),
-                        elevation = FilterChipDefaults.elevatedFilterChipElevation(elevation = 3.dp)
+                        }
                     )
                 }
             }
 
-            // Network Type Filter Row (All | 5G | 4G | 3G | 2G)
+            // Second Row: Circular Satellite View Toggle + Network Type Pills (All | 5G | 4G | 3G | 2G)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Circular Satellite View Toggle matching mockup
+                val satBg by animateColorAsState(
+                    targetValue = if (isSatelliteMode) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.surface.copy(alpha = 0.97f)
+                    },
+                    animationSpec = tween(200),
+                    label = "satBg"
+                )
+                val satTint by animateColorAsState(
+                    targetValue = if (isSatelliteMode) {
+                        MaterialTheme.colorScheme.onPrimary
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                    animationSpec = tween(200),
+                    label = "satTint"
+                )
+                Surface(
+                    onClick = {
+                        isSatelliteMode = !isSatelliteMode
+                        mapNoticeMessage = if (isSatelliteMode) {
+                            "Satellite View (Z18 Hybrid)"
+                        } else {
+                            "Street View (OpenStreetMap)"
+                        }
+                    },
+                    shape = CircleShape,
+                    color = satBg,
+                    contentColor = satTint,
+                    border = if (isSatelliteMode) null else floatingBorder,
+                    shadowElevation = 8.dp,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_satellite_dish),
+                            contentDescription = "Toggle Satellite View",
+                            modifier = Modifier.size(19.dp),
+                            tint = satTint
+                        )
+                    }
+                }
+
                 networks.forEach { net ->
-                    ElevatedFilterChip(
+                    SleekFilterPill(
+                        label = if (net == "All") "All Nets" else net,
                         selected = selectedNetwork == net,
+                        useContainerHighlight = true,
                         onClick = {
                             selectedNetwork = net
                             selectedSquareKey = null
-                        },
-                        label = {
-                            Text(
-                                text = if (net == "All") "All Nets" else net,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = if (selectedNetwork == net) FontWeight.Bold else FontWeight.Medium
-                            )
-                        },
-                        colors = FilterChipDefaults.elevatedFilterChipColors(
-                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
-                            labelColor = MaterialTheme.colorScheme.onSurface,
-                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
-                        ),
-                        elevation = FilterChipDefaults.elevatedFilterChipElevation(elevation = 2.dp)
+                        }
                     )
                 }
             }
 
-            // Transient Map Feedback Banner with matching smooth enter & exit animations
-            AnimatedVisibility(
-                visible = mapNoticeMessage != null,
-                enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
-                exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
+            // Quick Compass / Recenter Circular Icon Button (smoothly tucks away while Options drawer is open so it never collides with +/-)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.inverseSurface,
-                    contentColor = MaterialTheme.colorScheme.inverseOnSurface,
-                    shadowElevation = 4.dp
+                AnimatedVisibility(
+                    visible = !isBottomOptionsOpen,
+                    enter = fadeIn(tween(200)),
+                    exit = fadeOut(tween(160))
                 ) {
-                    Text(
-                        text = lastNoticeText,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        style = MaterialTheme.typography.labelMedium
-                    )
+                Surface(
+                    onClick = {
+                        selectedSquareKey = null
+                        onRequestMyLocation?.invoke()
+                        if (hasLiveGps) {
+                            activeFocusMode = MapFocusMode.MY_GPS
+                            moveCameraSmoothly(mapView, GeoPoint(userLat, userLng), 19.0)
+                        } else {
+                            activeFocusMode = MapFocusMode.BSU_CAMPUS
+                            moveCameraSmoothly(mapView, GeoPoint(CAMPUS_LAT, CAMPUS_LON), 18.5)
+                            mapNoticeMessage = "Locating GPS · Showing BSU Campus"
+                        }
+                    },
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    border = floatingBorder,
+                    shadowElevation = 8.dp,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_navigation_arrow),
+                            contentDescription = "Center on GPS",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                }
+
+                // Transient Map Feedback Banner
+                AnimatedVisibility(
+                    visible = mapNoticeMessage != null,
+                    enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
+                    exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.inverseSurface,
+                        contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                        shadowElevation = 4.dp
+                    ) {
+                        Text(
+                            text = lastNoticeText,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
                 }
             }
         }
 
-        // 3. Bottom-Left Satellite Toggle + Zoom Controls (+/-) + Compact Legend Pill
+        // 3. Bottom-Left Zoom Pill (+/-, hidden in Satellite View) + Compact Legend Pill
         Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 12.dp, bottom = animatedButtonsBottomPadding),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(start = 14.dp, bottom = animatedButtonsBottomPadding),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
             horizontalAlignment = Alignment.Start
         ) {
-            // 1-Tap Satellite / Street Map View Toggle
-            MapPillButton(
-                text = if (isSatelliteMode) "Street Map" else "Satellite",
-                containerColor = if (isSatelliteMode) {
-                    MaterialTheme.colorScheme.primaryContainer
-                } else {
-                    MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
-                },
-                contentColor = if (isSatelliteMode) {
-                    MaterialTheme.colorScheme.onPrimaryContainer
-                } else {
-                    MaterialTheme.colorScheme.onSurface
-                },
-                onClick = {
-                    isSatelliteMode = !isSatelliteMode
-                    mapNoticeMessage = if (isSatelliteMode) {
-                        "Switched to Satellite View"
-                    } else {
-                        "Switched to Street View"
-                    }
-                }
-            )
-
-            // Crisp Compose Zoom In / Zoom Out pill stack
-            Surface(
-                shape = RoundedCornerShape(14.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                shadowElevation = 5.dp
+            AnimatedVisibility(
+                visible = !isSatelliteMode,
+                enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
+                exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Surface(
-                        onClick = { mapView.controller.zoomIn() },
-                        color = Color.Transparent,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(40.dp)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(
-                                text = "+",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    border = floatingBorder,
+                    shadowElevation = 9.dp
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            onClick = { mapView.controller.zoomIn() },
+                            color = Color.Transparent,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(40.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "+",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
                         }
-                    }
-                    HorizontalDivider(modifier = Modifier.size(width = 28.dp, height = 1.dp))
-                    Surface(
-                        onClick = { mapView.controller.zoomOut() },
-                        color = Color.Transparent,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(40.dp)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(
-                                text = "−",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                        HorizontalDivider(modifier = Modifier.size(width = 24.dp, height = 1.dp))
+                        Surface(
+                            onClick = { mapView.controller.zoomOut() },
+                            color = Color.Transparent,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(40.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "−",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
                         }
                     }
                 }
             }
 
-            // Smoothly animated Legend Pill (fades & shrinks cleanly when square popup opens)
             AnimatedVisibility(
                 visible = selectedSquare == null,
                 enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)) + expandVertically(tween(PANEL_ANIM_ENTER_MS)),
                 exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)) + shrinkVertically(tween(PANEL_ANIM_EXIT_MS))
             ) {
                 Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
                     contentColor = MaterialTheme.colorScheme.onSurface,
-                    shadowElevation = 4.dp
+                    border = floatingBorder,
+                    shadowElevation = 8.dp
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -759,18 +872,27 @@ fun SignalHeatmapView(
             }
         }
 
-        // 4. Bottom-Right Floating Map Action Pills — always reachable and glide smoothly!
-        Column(
+        // 4. Right-Side Vertical Icon Tile Cards — smoothly bounded below top header & hide gracefully when Options drawer expands!
+        AnimatedVisibility(
+            visible = !isBottomOptionsOpen,
+            enter = fadeIn(tween(PANEL_ANIM_ENTER_MS)),
+            exit = fadeOut(tween(PANEL_ANIM_EXIT_MS)),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = animatedButtonsBottomPadding),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(
+                    top = topHeaderHeightDp + 6.dp,
+                    end = 14.dp,
+                    bottom = animatedButtonsBottomPadding
+                )
+        ) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
             horizontalAlignment = Alignment.End
         ) {
-            MapPillButton(
-                text = "Nearest Strong",
-                containerColor = SignalStrongGreen,
-                contentColor = Color.White,
+            SelectableMapIconTile(
+                iconRes = R.drawable.ic_nearest_strong,
+                label = "Nearest\nStrong",
+                selected = activeFocusMode == MapFocusMode.NEAREST_STRONG,
                 onClick = {
                     val refLat = if (hasLiveGps) userLat else mapView.mapCenter.latitude
                     val refLng = if (hasLiveGps) userLng else mapView.mapCenter.longitude
@@ -787,6 +909,7 @@ fun SignalHeatmapView(
                         results[0]
                     }
                     if (nearest != null) {
+                        activeFocusMode = MapFocusMode.NEAREST_STRONG
                         moveCameraSmoothly(
                             mapView,
                             GeoPoint(nearest.centerLat, nearest.centerLng),
@@ -794,26 +917,28 @@ fun SignalHeatmapView(
                         )
                         selectedSquareKey = nearest.gridKey
                     } else {
-                        mapNoticeMessage = "No Strong (green) squares found for this filter"
+                        mapNoticeMessage = "No Strong (green) squares for this filter"
                     }
                 }
             )
 
-            MapPillButton(
-                text = "BSU Campus",
-                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
+            SelectableMapIconTile(
+                iconRes = R.drawable.ic_campus_building,
+                label = "BSU Campus",
+                selected = activeFocusMode == MapFocusMode.BSU_CAMPUS,
                 onClick = {
+                    activeFocusMode = MapFocusMode.BSU_CAMPUS
                     selectedSquareKey = null
                     moveCameraSmoothly(mapView, GeoPoint(CAMPUS_LAT, CAMPUS_LON), 18.5)
                 }
             )
 
-            MapPillButton(
-                text = if (hasLiveGps) "My GPS" else "Find GPS",
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
+            SelectableMapIconTile(
+                iconRes = R.drawable.ic_pin_gps,
+                label = if (hasLiveGps) "My GPS" else "Find GPS",
+                selected = activeFocusMode == MapFocusMode.MY_GPS,
                 onClick = {
+                    activeFocusMode = MapFocusMode.MY_GPS
                     selectedSquareKey = null
                     onRequestMyLocation?.invoke()
                     if (hasLiveGps) {
@@ -824,9 +949,9 @@ fun SignalHeatmapView(
                 }
             )
         }
+        }
 
         // 5. Upgraded Square-Tap Carrier Comparison Sheet/Card
-        // Uses cached lastDisplayedSquare so BOTH fade-in/slide-up AND fade-out/slide-down play smoothly!
         AnimatedVisibility(
             visible = selectedSquare != null,
             enter = fadeIn(tween(PANEL_ANIM_ENTER_MS, easing = FastOutSlowInEasing)) +
@@ -842,7 +967,7 @@ fun SignalHeatmapView(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .padding(start = 12.dp, end = 12.dp, bottom = animatedPopupBottomPadding)
+                .padding(start = 14.dp, end = 14.dp, bottom = animatedPopupBottomPadding)
                 .onGloballyPositioned { coords ->
                     popupCardHeightPx = coords.size.height
                 }
@@ -851,9 +976,124 @@ fun SignalHeatmapView(
             if (displaySquare != null) {
                 SquareComparisonCard(
                     summary = displaySquare,
-                    onClose = { selectedSquareKey = null }
+                    onClose = {
+                        selectedSquareKey = null
+                        if (activeFocusMode == MapFocusMode.NEAREST_STRONG) {
+                            activeFocusMode = MapFocusMode.NONE
+                        }
+                    }
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun SleekFilterPill(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    useContainerHighlight: Boolean = false,
+    onClick: () -> Unit
+) {
+    val bgColor by animateColorAsState(
+        targetValue = when {
+            selected && useContainerHighlight -> MaterialTheme.colorScheme.primaryContainer
+            selected -> MaterialTheme.colorScheme.primary
+            else -> MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+        },
+        animationSpec = tween(200),
+        label = "chipBg"
+    )
+    val textColor by animateColorAsState(
+        targetValue = when {
+            selected && useContainerHighlight -> MaterialTheme.colorScheme.onPrimaryContainer
+            selected -> MaterialTheme.colorScheme.onPrimary
+            else -> MaterialTheme.colorScheme.onSurface
+        },
+        animationSpec = tween(200),
+        label = "chipText"
+    )
+
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(22.dp),
+        color = bgColor,
+        contentColor = textColor,
+        border = if (selected) null else BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        shadowElevation = if (selected) 8.dp else 6.dp
+    ) {
+        Box(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                color = textColor,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectableMapIconTile(
+    @DrawableRes iconRes: Int,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val containerColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+        },
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "tileContainer"
+    )
+    val contentColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        },
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "tileContent"
+    )
+
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = containerColor,
+        contentColor = contentColor,
+        border = if (selected) null else BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        shadowElevation = if (selected) 10.dp else 8.dp,
+        modifier = Modifier.width(74.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Icon(
+                painter = painterResource(iconRes),
+                contentDescription = label,
+                modifier = Modifier.size(20.dp),
+                tint = contentColor
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 10.sp,
+                lineHeight = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = contentColor,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
@@ -862,7 +1102,7 @@ fun SignalHeatmapView(
 private fun LegendDot(label: String, color: Color) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         Box(
             modifier = Modifier
@@ -873,31 +1113,8 @@ private fun LegendDot(label: String, color: Color) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Medium,
+            fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface
-        )
-    }
-}
-
-@Composable
-private fun MapPillButton(
-    text: String,
-    containerColor: Color,
-    contentColor: Color,
-    onClick: () -> Unit
-) {
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(16.dp),
-        color = containerColor,
-        contentColor = contentColor,
-        shadowElevation = 5.dp
-    ) {
-        Text(
-            text = text,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.SemiBold
         )
     }
 }
@@ -919,15 +1136,16 @@ private fun SquareComparisonCard(
     }
 
     Card(
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface
         ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
+        border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -950,12 +1168,13 @@ private fun SquareComparisonCard(
                         )
                     }
                     Column {
+                        val countLabel = if (summary.filteredReadings.size == 1) "1 reading" else "${summary.filteredReadings.size} readings"
                         Text(
                             text = "${
                                 String.format(Locale.US, "%.1f", summary.avgBars)
-                            } avg bars · ${summary.filteredReadings.size} readings",
+                            } avg bars · $countLabel",
                             style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.Bold
                         )
                         Text(
                             text = "Updated $relativeTime",
@@ -965,11 +1184,21 @@ private fun SquareComparisonCard(
                     }
                 }
 
-                TextButton(
+                Surface(
                     onClick = onClose,
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(30.dp)
                 ) {
-                    Text("Close")
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_close_x),
+                            contentDescription = "Close",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
             }
 
@@ -992,6 +1221,12 @@ private fun SquareComparisonCard(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_cell_tower),
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
                         Text(
                             text = cName,
                             style = MaterialTheme.typography.bodyMedium,
@@ -1001,7 +1236,7 @@ private fun SquareComparisonCard(
                             val net = cList.maxByOrNull { it.timestamp }?.networkType ?: ""
                             if (net.isNotBlank()) {
                                 Surface(
-                                    shape = RoundedCornerShape(5.dp),
+                                    shape = RoundedCornerShape(6.dp),
                                     color = MaterialTheme.colorScheme.surfaceVariant
                                 ) {
                                     Text(
@@ -1056,15 +1291,28 @@ private fun SquareComparisonCard(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 4.dp),
+                    .padding(top = 5.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Wi-Fi",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        painter = painterResource(
+                            if (wifiReadings.isNotEmpty()) R.drawable.ic_wifi_on else R.drawable.ic_wifi_off
+                        ),
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Wi-Fi",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
                 Text(
                     text = if (wifiReadings.isNotEmpty()) {
                         "Avg ${wifiReadings.average().toInt()} dBm (${wifiReadings.size} samples)"
